@@ -22,6 +22,20 @@ builds:
       - arm64
     ldflags:
       - -X=main.Build={{.Commit}} -X=main.BuildTime={{.Date}} -X=main.Version={{.Version}}
+  - goos:
+      - linux
+      - darwin
+      - freebsd
+      - windows
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/vgwtaped
+    binary: vgwtaped
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -X=main.Build={{.Commit}} -X=main.BuildTime={{.Date}} -X=main.Version={{.Version}}
 
 archives:
   - formats: [ 'tar.gz' ]

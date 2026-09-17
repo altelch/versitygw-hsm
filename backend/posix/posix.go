@@ -586,6 +586,12 @@ func (p *Posix) versioningEnabled() bool {
 	return p.versioningDir != ""
 }
 
+// VersioningDir returns the configured bucket versioning directory, or an
+// empty string when bucket versioning is disabled.
+func (p *Posix) VersioningDir() string {
+	return p.versioningDir
+}
+
 // validateVersionId checks if the input versionId is 'ulid' compatible
 func (p *Posix) validateVersionId(versionId string) error {
 	if versionId == "" || versionId == "null" {

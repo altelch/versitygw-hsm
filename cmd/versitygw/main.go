@@ -137,6 +137,7 @@ func main() {
 
 	app.Commands = []*cli.Command{
 		posixCommand,
+		gwcli.PosixHsmCommand(),
 		gwcli.ScoutfsCommand(),
 		gwcli.S3Command(),
 		gwcli.AzureCommand(),

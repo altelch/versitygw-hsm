@@ -23,6 +23,8 @@ DCCMD=docker-compose
 DOCKERCOMPOSE=$(DCCMD) -f tests/docker-compose.yml --env-file .env.dev --project-directory .
 
 BIN=versitygw
+VGWTAPED_BIN=vgwtaped
+VGWTAPED_CMD=./cmd/vgwtaped
 VGWRDMA_BIN=vgwrdma
 VGWRDMA_CMD=./cmd/vgwrdma
 VGWRDMA_BUILDER_DOCKERFILE ?= build/vgwrdma-builder/Dockerfile
@@ -72,6 +74,10 @@ build: $(BIN)
 .PHONY: $(BIN)
 $(BIN):
 	$(GOBUILD) $(LDFLAGS) -o $(BIN) cmd/$(BIN)/*.go
+
+.PHONY: vgwtaped
+vgwtaped:
+	$(GOBUILD) $(LDFLAGS) -o $(VGWTAPED_BIN) $(VGWTAPED_CMD)
 
 $(VGWRDMA_WRAPPER_LIB): cuwrapper/cuobjserver_wrapper.cpp cuwrapper/cuobjserver_wrapper.h
 	$(CXX) -c -fPIC -std=c++17 \
@@ -183,6 +189,7 @@ clean:
 .PHONY: cleanall
 cleanall: clean
 	rm -f $(BIN)
+	rm -f $(VGWTAPED_BIN)
 	rm -f $(VGWRDMA_BIN)
 	rm -f $(CUOBJTEST_BIN)
 	rm -f $(VGWRDMA_WRAPPER_LIB)
