@@ -39,18 +39,20 @@ import (
 )
 
 var (
-	rootdir       string
-	stateDir      string
-	policyPath    string
-	driverName    string
-	bareosConsole string
-	bareosPool    string
-	bareosDrive   string
-	wg            sync.WaitGroup
-	workers       int
-	scanInterval  time.Duration
-	gcEnabled     bool
-	logDebug      bool
+	rootdir        string
+	stateDir       string
+	policyPath     string
+	driverName     string
+	bareosClient   string
+	bareosBackup   string
+	bareosRestore  string
+	bareosConf     string
+	bareosDirector string
+	wg             sync.WaitGroup
+	workers        int
+	scanInterval   time.Duration
+	gcEnabled      bool
+	logDebug       bool
 )
 
 func buildDriver() (posixhsm.HsmDriver, error) {
@@ -58,13 +60,12 @@ func buildDriver() (posixhsm.HsmDriver, error) {
 	case "", "mock":
 		return posixhsm.NewMockDriver(stateDir)
 	case "bareos":
-		if bareosConsole == "" {
-			return nil, fmt.Errorf("bareos driver: --bareos-console host:port is required")
-		}
 		return posixhsm.NewBareosDriver(posixhsm.BareosOpts{
-			Console: bareosConsole,
-			Pool:    bareosPool,
-			Drive:   bareosDrive,
+			Client:         bareosClient,
+			BackupJob:      bareosBackup,
+			RestoreJob:     bareosRestore,
+			BConsoleConfig: bareosConf,
+			Director:       bareosDirector,
 		})
 	default:
 		return nil, fmt.Errorf("unknown driver %q (supported: mock, bareos)", driverName)
@@ -213,9 +214,11 @@ func main() {
 		&cli.StringFlag{Name: "state-dir", Usage: "shared HSM state directory (job queue, driver state)", EnvVars: []string{"VGWTAPED_STATE_DIR"}, Destination: &stateDir},
 		&cli.StringFlag{Name: "policy", Usage: "path to a tiering policy YAML file", EnvVars: []string{"VGWTAPED_POLICY"}, Destination: &policyPath},
 		&cli.StringFlag{Name: "driver", Value: "mock", Usage: "HSM driver: mock (default) or bareos", EnvVars: []string{"VGWTAPED_DRIVER"}, Destination: &driverName},
-		&cli.StringFlag{Name: "bareos-console", Usage: "bareos console endpoint host:port (eg 127.0.0.1:913)", EnvVars: []string{"VGWTAPED_BAREOS_CONSOLE"}, Destination: &bareosConsole},
-		&cli.StringFlag{Name: "bareos-pool", Value: "Default", Usage: "bareos pool name", EnvVars: []string{"VGWTAPED_BAREOS_POOL"}, Destination: &bareosPool},
-		&cli.StringFlag{Name: "bareos-drive", Usage: "bareos drive label (eg 'File1')", EnvVars: []string{"VGWTAPED_BAREOS_DRIVE"}, Destination: &bareosDrive},
+		&cli.StringFlag{Name: "bareos-client", Usage: "Bareos Client (File Daemon) resource for this gateway host", EnvVars: []string{"VGWTAPED_BAREOS_CLIENT"}, Destination: &bareosClient},
+		&cli.StringFlag{Name: "bareos-backup", Usage: "name of a Type=Backup Job that archives the tiered objects", EnvVars: []string{"VGWTAPED_BAREOS_BACKUP"}, Destination: &bareosBackup},
+		&cli.StringFlag{Name: "bareos-restore", Usage: "name of a Type=Restore Job used for in-place single-file restores", EnvVars: []string{"VGWTAPED_BAREOS_RESTORE"}, Destination: &bareosRestore},
+		&cli.StringFlag{Name: "bareos-conf", Usage: "bconsole -c config dir/file (defines the Director to talk to)", EnvVars: []string{"VGWTAPED_BAREOS_CONF"}, Destination: &bareosConf},
+		&cli.StringFlag{Name: "bareos-director", Usage: "bconsole -D directory (named console), optional", EnvVars: []string{"VGWTAPED_BAREOS_DIRECTOR"}, Destination: &bareosDirector},
 		&cli.IntFlag{Name: "workers", Value: 4, Usage: "number of concurrent restore workers", EnvVars: []string{"VGWTAPED_WORKERS"}, Destination: &workers},
 		&cli.DurationFlag{Name: "scan-interval", Value: 5 * time.Minute, Usage: "interval between tier/sweep/gc passes", EnvVars: []string{"VGWTAPED_SCAN_INTERVAL"}, Destination: &scanInterval},
 		&cli.BoolFlag{Name: "gc", Value: true, Usage: "enable periodic purge pass", EnvVars: []string{"VGWTAPED_GC"}, Destination: &gcEnabled},
