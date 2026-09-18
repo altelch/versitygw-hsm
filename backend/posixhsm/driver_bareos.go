@@ -131,6 +131,12 @@ type BareosHsmDriver struct {
 
 var _ HsmDriver = (*BareosHsmDriver)(nil)
 
+// SingleWave reports true: ArchiveWave runs one Fixed-content Bareos job
+// (run job=<BackupJob>); it does not consume the wave's file list. Splitting
+// the tier set into waves would re-run the same job several times per pass,
+// so the daemon passes the whole due set in a single call.
+func (*BareosHsmDriver) SingleWave() bool { return true }
+
 // consoleExec executes a bconsole batch. The command list (without `quit`,
 // which is appended by the default implementation) is sent on standard
 // input, and the combined stdout+stderr is returned. A non-nil returned

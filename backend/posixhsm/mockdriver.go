@@ -124,7 +124,7 @@ func (m *MockDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]strin
 	m.next.Store(uint64(base))
 	m.mu.Unlock()
 
-	// Phase 2: read each file and append at its reserved offset.
+	// Phase 2: read each file and write at its reserved offset.
 	f, err := os.OpenFile(m.dataPath, os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("mock driver: open: %w", err)
@@ -134,6 +134,9 @@ func (m *MockDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]strin
 		if wf.Size == 0 {
 			locs[i] = m.makeLocator(offsets[i], 0)
 			continue
+		}
+		if _, s_err := f.Seek(offsets[i], io.SeekStart); s_err != nil {
+			return nil, fmt.Errorf("mock driver: seek to %d: %w", offsets[i], s_err)
 		}
 		src, err := os.Open(wf.Path)
 		if err != nil {

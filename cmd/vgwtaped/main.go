@@ -26,6 +26,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -48,6 +49,7 @@ var (
 	bareosRestore  string
 	bareosConf     string
 	bareosDirector string
+	zfsDataset     string
 	wg             sync.WaitGroup
 	workers        int
 	scanInterval   time.Duration
@@ -88,7 +90,16 @@ func runDaemon(_ *cli.Context) error {
 		return fmt.Errorf("load policy: %w", err)
 	}
 
-	meta := meta.XattrMeta{}.WithRootDir(rootdir)
+	absRoot, aerr := filepath.Abs(rootdir)
+	if aerr != nil {
+		return fmt.Errorf("resolve rootdir: %w", aerr)
+	}
+	// Canonicalize rootdir once and use it everywhere: the daemon's xattr
+	// path resolution (state.XattrMeta{}.WithRootDir) bypasses its own
+	// rootdir only when the passed bucket is absolute, and lister-emitted
+	// candidate paths are also used as raw paths by the daemon, so both
+	// must agree on an absolute root.
+	meta := meta.XattrMeta{}.WithRootDir(absRoot)
 	q, err := queue.New(stateDir)
 	if err != nil {
 		return fmt.Errorf("init queue: %w", err)
@@ -100,14 +111,23 @@ func runDaemon(_ *cli.Context) error {
 	}
 	defer drv.Close()
 
+	var lister daemon.Lister = daemon.NewFSLister(absRoot)
+	if zfsDataset != "" {
+		lister = daemon.NewZfsLister(absRoot, zfsDataset, stateDir, daemon.NewExecZfsRunner("zfs"))
+		log.Printf("vgwtaped using ZFS diff against dataset %q (mount root must equal --rootdir)", zfsDataset)
+	}
+
 	d := daemon.New(daemon.Config{
 		Driver:   drv,
 		Queue:    q,
 		Meta:     meta,
 		Policy:   pol,
-		Lister:   daemon.NewFSLister(rootdir),
+		Lister:   lister,
 		WaveSize: 256,
 	})
+	if s, ok := drv.(daemon.SingleWaveArchiver); ok && s.SingleWave() {
+		log.Printf("driver %q reports single-wave: archiving the full due set in one job per tier/sweep pass", drv.Name())
+	}
 
 	log.Printf("vgwtaped starting: rootdir=%s state-dir=%s driver=%q workers=%d scan-interval=%s",
 		rootdir, stateDir, drv.Name(), workers, scanInterval)
@@ -219,6 +239,7 @@ func main() {
 		&cli.StringFlag{Name: "bareos-restore", Usage: "name of a Type=Restore Job used for in-place single-file restores", EnvVars: []string{"VGWTAPED_BAREOS_RESTORE"}, Destination: &bareosRestore},
 		&cli.StringFlag{Name: "bareos-conf", Usage: "bconsole -c config dir/file (defines the Director to talk to)", EnvVars: []string{"VGWTAPED_BAREOS_CONF"}, Destination: &bareosConf},
 		&cli.StringFlag{Name: "bareos-director", Usage: "bconsole -D directory (named console), optional", EnvVars: []string{"VGWTAPED_BAREOS_DIRECTOR"}, Destination: &bareosDirector},
+		&cli.StringFlag{Name: "zfs-dataset", Usage: "ZFS dataset name to tier (enables incremental scan via zfs diff; mount point must equal --rootdir)", EnvVars: []string{"VGWTAPED_ZFS_DATASET"}, Destination: &zfsDataset},
 		&cli.IntFlag{Name: "workers", Value: 4, Usage: "number of concurrent restore workers", EnvVars: []string{"VGWTAPED_WORKERS"}, Destination: &workers},
 		&cli.DurationFlag{Name: "scan-interval", Value: 5 * time.Minute, Usage: "interval between tier/sweep/gc passes", EnvVars: []string{"VGWTAPED_SCAN_INTERVAL"}, Destination: &scanInterval},
 		&cli.BoolFlag{Name: "gc", Value: true, Usage: "enable periodic purge pass", EnvVars: []string{"VGWTAPED_GC"}, Destination: &gcEnabled},

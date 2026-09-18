@@ -120,9 +120,9 @@ func TestConcurrentClaimNoDup(t *testing.T) {
 	}
 
 	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		seen  = map[uint64]bool{}
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		seen   = map[uint64]bool{}
 		claims int
 	)
 	const workers = 8

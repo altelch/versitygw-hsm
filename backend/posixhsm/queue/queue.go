@@ -50,14 +50,14 @@ const (
 // tier/purge (single object). Batch/archive waves are grouped by the
 // daemon from multiple tier jobs.
 type Job struct {
-	Op          JobOp   `json:"op"`
-	Bucket      string  `json:"bucket"`
-	Key         string  `json:"key"`
-	VersionID   string  `json:"versionId,omitempty"`
-	Days        int32   `json:"days,omitempty"`      // restore window, days
-	Loc         string  `json:"locator,omitempty"`   // driver locator
-	SubmittedAt int64   `json:"submittedAt"`         // unix seconds
-	ID          uint64  `json:"id"`
+	Op          JobOp  `json:"op"`
+	Bucket      string `json:"bucket"`
+	Key         string `json:"key"`
+	VersionID   string `json:"versionId,omitempty"`
+	Days        int32  `json:"days,omitempty"`    // restore window, days
+	Loc         string `json:"locator,omitempty"` // driver locator
+	SubmittedAt int64  `json:"submittedAt"`       // unix seconds
+	ID          uint64 `json:"id"`
 }
 
 func (j Job) identity() string {

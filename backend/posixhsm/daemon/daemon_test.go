@@ -16,6 +16,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -173,4 +175,146 @@ func TestDaemonPolicyRespectsMinAge(t *testing.T) {
 	if tiered != 0 {
 		t.Fatalf("expected 0 (mtime < min-age), got %d", tiered)
 	}
+}
+
+// countDriver records how many ArchiveWave calls arrive and how many files
+// each carried. singleWaveDriver adds the SingleWave marker, as the Bareos
+// driver does: the daemon must then deliver the whole due set in ONE call.
+type countDriver struct {
+	calls [][]posixhsm.WaveFile
+}
+
+func (c *countDriver) Name() string { return "counting" }
+
+func (c *countDriver) ArchiveWave(_ context.Context, files []posixhsm.WaveFile) ([]string, error) {
+	c.calls = append(c.calls, files)
+	locs := make([]string, len(files))
+	for i, f := range files {
+		locs[i] = fmt.Sprintf("count:%d:%s", i, f.Path)
+	}
+	return locs, nil
+}
+
+func (c *countDriver) Restore(_ context.Context, _ string, _ io.Writer, _ int64) error {
+	return nil
+}
+func (c *countDriver) Purge(_ context.Context, _ string) error { return nil }
+func (c *countDriver) Close() error                            { return nil }
+
+type singleWaveDriver struct{ countDriver }
+
+func (*singleWaveDriver) SingleWave() bool { return true }
+
+// countSetup wires a Daemon over a tree with `n` old, tier-eligible objects.
+func countSetup(t *testing.T, now time.Time, drv posixhsm.HsmDriver, waveSize, n int) *Daemon {
+	t.Helper()
+	base := t.TempDir()
+	rootdir := filepath.Join(base, "root")
+	statedir := filepath.Join(base, "state")
+	const bucket = "bkt"
+	for i := 0; i < n; i++ {
+		obj := filepath.Join(rootdir, bucket, fmt.Sprintf("obj-%02d", i))
+		if err := os.MkdirAll(filepath.Dir(obj), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(obj, []byte("body"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		old := now.Add(-2 * time.Hour)
+		_ = os.Chtimes(obj, old, old)
+	}
+	q, err := queue.New(statedir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(Config{
+		Driver:   drv,
+		Queue:    q,
+		Meta:     meta.XattrMeta{},
+		Policy:   &policy.Policy{Default: policy.Rule{MinAge: 1 * time.Hour}},
+		Lister:   newFsLister(rootdir),
+		WaveSize: waveSize,
+	})
+	d.now = func() time.Time { return now }
+	return d
+}
+
+func TestDaemonSingleWaveDriver(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	// Without the marker: 9 due files, wave size 4 -> waves of 4+4+1.
+	var plain countDriver
+	d := countSetup(t, now, &plain, 4, 9)
+	if tiered, err := d.Tier(ctx); err != nil || tiered != 9 {
+		t.Fatalf("plain tier: tiered=%d err=%v", tiered, err)
+	}
+	if len(plain.calls) != 3 {
+		t.Fatalf("expected 3 waves for a wave-immune driver, got %d", len(plain.calls))
+	}
+
+	// With the marker: WaveSize 4 must be ignored -> exactly one call.
+	var sw singleWaveDriver
+	d2 := countSetup(t, now, &sw, 4, 9)
+	if tiered, err := d2.Tier(ctx); err != nil || tiered != 9 {
+		t.Fatalf("single-wave tier: tiered=%d err=%v", tiered, err)
+	}
+	if len(sw.calls) != 1 {
+		t.Fatalf("expected 1 ArchiveWave call for a single-wave driver, got %d", len(sw.calls))
+	}
+	if len(sw.calls[0]) != 9 {
+		t.Fatalf("expected the whole due set in one wave, got %d files", len(sw.calls[0]))
+	}
+	// and every object really went offline
+	for i := 0; i < 9; i++ {
+		p := filepath.Join(d2.lister.(*fsLister).rootdir, "bkt", fmt.Sprintf("obj-%02d", i))
+		if fi, err := os.Stat(p); err != nil || fi.Size() != 0 {
+			t.Fatalf("obj-%02d not truncated: %v", i, err)
+		}
+		if !state.Store(d2.meta, p).Offline {
+			t.Fatalf("obj-%02d not offline", i)
+		}
+	}
+}
+
+func TestDaemonSingleWaveSweep(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	var sw singleWaveDriver
+	d := countSetup(t, now, &sw, 4, 9)
+	// tier once (call 1), then mark everything expired and sweep.
+	if _, err := d.Tier(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 9; i++ {
+		p := filepath.Join(d.lister.(*fsLister).rootdir, "bkt", fmt.Sprintf("obj-%02d", i))
+		st := state.Store(d.meta, p)
+		if !st.Offline {
+			t.Fatalf("obj-%02d should be offline pre-sweep", i)
+		}
+		if err := state.Set(d.meta, p, state.Offline, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := state.Set(d.meta, p, state.Expiry, now.Add(-time.Minute).UTC().Format(time.RFC3339)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// sweep must re-tier all 9 expired objects in one call.
+	reTiered, err := d.Sweep(ctx)
+	if err != nil || reTiered != 9 {
+		t.Fatalf("sweep: reTiered=%d err=%v", reTiered, err)
+	}
+	calls := sw.calls
+	if len(calls) != 2 || len(calls[1]) != 9 {
+		t.Fatalf("expected a single 9-file sweep wave, got calls=%v", waveCount(calls))
+	}
+}
+
+func waveCount(calls [][]posixhsm.WaveFile) []int {
+	out := make([]int, len(calls))
+	for i, c := range calls {
+		out[i] = len(c)
+	}
+	return out
 }

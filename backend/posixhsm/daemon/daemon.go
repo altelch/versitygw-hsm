@@ -15,9 +15,11 @@
 // Package vgwtape implements the HSM tiering daemon (vgwtaped). It owns all
 // physical data movement for the posix-hsm backend:
 //
-//   - Tier (archive): batches objects due for tiering into one wave, hands
-//     the wave to the HsmDriver (e.g. Bareos), and once the archive succeeds
-//     records size+locator and truncates each object to zero bytes.
+//   - Tier (archive): collects all objects due for tiering, batches them
+//     into waves, hands each wave to the HsmDriver (e.g. Bareos), and once
+//     the archive succeeds records size+locator and truncates each object
+//     to zero bytes. Drivers reporting SingleWave() (see SingleWaveArchiver)
+//     receive the whole due set in one call per pass.
 //   - Restore: claims restore jobs, materializes the data back over the
 //     truncated object (preserving inode + xattrs), and records expiry.
 //   - Sweep: re-tiers objects whose restored copy is past its expiry window.
@@ -32,6 +34,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -59,6 +62,56 @@ type Lister interface {
 	ListCandidates(ctx context.Context, bucket string) ([]Candidate, error)
 	// ResolvePath maps (bucket,key,versionId) to an absolute object path.
 	ResolvePath(bucket, key, versionId string) string
+}
+
+// PassBeginner is an optional Lister extension for listers that have a
+// per-pass setup step (e.g. a ZFS snapshot diff).  The daemon calls it once
+// before iterating buckets in a Tier or Sweep pass.
+type PassBeginner interface {
+	Begin(ctx context.Context) error
+}
+
+// ConsiderNoter is an optional Lister extension.  The daemon calls it for a
+// candidate it chose NOT to tier (offline, restoring, or not-yet-eligible);
+// the lister can keep the object in an internal "aging" index so it is
+// reconsidered on the next pass.
+type ConsiderNoter interface {
+	RememberConsidered(bucket, path string, mtime time.Time, size int64)
+}
+
+// Forgetter is an optional Lister extension.  The daemon calls it for a
+// candidate that was successfully tiered this pass, so the lister can drop
+// it from any internal index.
+type Forgetter interface {
+	Forget(bucket, path string)
+}
+
+// SingleWaveArchiver is an optional HsmDriver extension.  A driver that
+// reports true wants the entire due set passed in a single ArchiveWave call
+// per Tier/Sweep pass.  This is for drivers whose ArchiveWave triggers a
+// fixed-content job (e.g. Bareos: the job archives whatever its FileSet
+// covers; the file list is advisory): splitting the due set into waves
+// would just run the same job repeatedly per pass.
+type SingleWaveArchiver interface {
+	SingleWave() bool
+}
+
+func (d *Daemon) beginPass(ctx context.Context) {
+	if b, ok := d.lister.(PassBeginner); ok {
+		_ = b.Begin(ctx) // graceful degradation on error
+	}
+}
+
+func (d *Daemon) rememberConsidered(bucket, path string, mtime time.Time, size int64) {
+	if n, ok := d.lister.(ConsiderNoter); ok {
+		n.RememberConsidered(bucket, path, mtime, size)
+	}
+}
+
+func (d *Daemon) forget(bucket, path string) {
+	if f, ok := d.lister.(Forgetter); ok {
+		f.Forget(bucket, path)
+	}
 }
 
 // fsLister walks a real posix tree rooted at rootdir.
@@ -132,11 +185,14 @@ type Daemon struct {
 
 // Config constructs a Daemon.
 type Config struct {
-	Driver   posixhsm.HsmDriver
-	Queue    *queue.Queue
-	Meta     meta.MetadataStorer
-	Policy   *policy.Policy
-	Lister   Lister
+	Driver posixhsm.HsmDriver
+	Queue  *queue.Queue
+	Meta   meta.MetadataStorer
+	Policy *policy.Policy
+	Lister Lister
+	// WaveSize is the max files per ArchiveWave call. Ignored (forced to
+	// one wave per pass) when the driver implements SingleWaveArchiver and
+	// reports SingleWave() == true.
 	WaveSize int
 }
 
@@ -144,6 +200,9 @@ func New(cfg Config) *Daemon {
 	wave := cfg.WaveSize
 	if wave <= 0 {
 		wave = 256
+	}
+	if s, ok := cfg.Driver.(SingleWaveArchiver); ok && s.SingleWave() {
+		wave = math.MaxInt
 	}
 	return &Daemon{
 		drv:      cfg.Driver,
@@ -163,12 +222,18 @@ func (d *Daemon) Tier(ctx context.Context) (int, error) {
 	if d.pol == nil {
 		return 0, errors.New("vgwtape: no policy configured")
 	}
+	d.beginPass(ctx)
 	buckets, err := d.lister.Buckets(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	var due []posixhsm.WaveFile
+	type keyedFile struct {
+		wf     posixhsm.WaveFile
+		bucket string
+	}
+	var dueKeyed []keyedFile
 	for _, bucket := range buckets {
 		rule := d.pol.RuleFor(bucket)
 		cands, err := d.lister.ListCandidates(ctx, bucket)
@@ -178,6 +243,7 @@ func (d *Daemon) Tier(ctx context.Context) (int, error) {
 		for _, c := range cands {
 			st := state.Store(d.meta, c.Path)
 			if st.Offline || st.Restoring {
+				d.rememberConsidered(bucket, c.Path, c.Mtime, c.Size)
 				continue
 			}
 			obj := policy.ObjInfo{
@@ -187,11 +253,13 @@ func (d *Daemon) Tier(ctx context.Context) (int, error) {
 				Size:         c.Size,
 			}
 			if !rule.ShouldTier(obj, d.now()) {
+				d.rememberConsidered(bucket, c.Path, c.Mtime, c.Size)
 				continue
 			}
 			// enqueue a tier job for bookkeeping/dedup
 			_, _ = d.q.Enqueue(queue.Job{Op: queue.JobOpTier, Bucket: bucket, Key: c.Key})
 			due = append(due, posixhsm.WaveFile{Path: c.Path, Size: c.Size})
+			dueKeyed = append(dueKeyed, keyedFile{wf: posixhsm.WaveFile{Path: c.Path, Size: c.Size}, bucket: bucket})
 		}
 	}
 	if len(due) == 0 {
@@ -199,7 +267,16 @@ func (d *Daemon) Tier(ctx context.Context) (int, error) {
 	}
 
 	// batch into waves and archive
-	return d.archiveWaves(ctx, due)
+	n, err := d.archiveWaves(ctx, due)
+	if err == nil {
+		// objects successfully tiered: drop them from the lister's aging
+		// index (they are now offline; they return to candidacy after a
+		// restore, at which point they are re-remembered on a later pass).
+		for _, kf := range dueKeyed {
+			d.forget(kf.bucket, kf.wf.Path)
+		}
+	}
+	return n, err
 }
 
 // archiveWaves splits due files into waves and runs each through the driver.
@@ -293,6 +370,7 @@ func (d *Daemon) RestoreJobs(ctx context.Context, max int) (int, error) {
 // re-check the age/size/tag policy, which only governs initial tiering.
 // Expired objects are batched and archived the same way as a fresh tier.
 func (d *Daemon) Sweep(ctx context.Context) (int, error) {
+	d.beginPass(ctx)
 	buckets, err := d.lister.Buckets(ctx)
 	if err != nil {
 		return 0, err
