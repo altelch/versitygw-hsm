@@ -168,6 +168,8 @@ func TestGetBucketLocation(ts *TestState) {
 func TestPutObject(ts *TestState) {
 	ts.Run(PutObject_non_existing_bucket)
 	ts.Run(PutObject_special_chars)
+	ts.Run(PutObject_aborted_plain_body)
+	ts.Run(PutObject_plain_body_with_decoded_length)
 	ts.Run(PutObject_tagging)
 	ts.Run(PutObject_missing_object_lock_retention_config)
 	ts.Run(PutObject_with_object_lock)
@@ -472,6 +474,7 @@ func TestUploadPart(ts *TestState) {
 		ts.Run(UploadPart_with_checksums_success)
 	}
 	ts.Run(UploadPart_success)
+	ts.Run(UploadPart_plain_body_with_decoded_length)
 	ts.Run(UploadPart_etag_quoting_consistency)
 }
 
@@ -687,6 +690,7 @@ func TestDeleteBucketCors(ts *TestState) {
 func TestPutBucketWebsite(ts *TestState) {
 	ts.Run(PutBucketWebsite_non_existing_bucket)
 	ts.Run(PutBucketWebsite_empty_suffix)
+	ts.Run(PutBucketWebsite_empty_configuration)
 	ts.Run(PutBucketWebsite_suffix_with_slash)
 	ts.Run(PutBucketWebsite_invalid_redirect_protocol)
 	ts.Run(PutBucketWebsite_redirectAll_index_error_routingRules)
@@ -990,6 +994,12 @@ func TestPosix(ts *TestState) {
 	ts.Run(DeleteObject_name_too_long)
 	ts.Run(CopyObject_overwrite_same_dir_object)
 	ts.Run(CopyObject_overwrite_same_file_object)
+	ts.Run(CompleteMultipartUpload_overwrite_dir_obj)
+	if ts.conf.versioningEnabled {
+		ts.Run(CompleteMultipartUpload_overwrite_dir_obj_delete_marker)
+	}
+	ts.Run(ObjectTagging_trailing_slash_counterpart)
+	ts.Run(ObjectLock_trailing_slash_counterpart)
 	ts.Run(DeleteObject_directory_not_empty)
 	if !ts.conf.windowsTests {
 		ts.Run(PutObject_race_with_delete)
@@ -1094,6 +1104,9 @@ func TestScoutfs(ts *TestState) {
 	ts.Run(DeleteObject_name_too_long)
 	ts.Run(CopyObject_overwrite_same_dir_object)
 	ts.Run(CopyObject_overwrite_same_file_object)
+	ts.Run(CompleteMultipartUpload_overwrite_dir_obj)
+	ts.Run(ObjectTagging_trailing_slash_counterpart)
+	ts.Run(ObjectLock_trailing_slash_counterpart)
 	ts.Run(DeleteObject_directory_not_empty)
 }
 
@@ -1941,12 +1954,16 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_PutObject_null_versionId_obj)
 	ts.Run(Versioning_PutObject_overwrite_null_versionId_obj)
 	ts.Run(Versioning_PutObject_success)
+	ts.Run(Versioning_PutObject_dir_object_new_version_resets_attributes)
 	// CopyObject action
 	ts.Run(Versioning_CopyObject_invalid_versionId)
 	ts.Run(Versioning_CopyObject_encoded_versionid_separator_invalid_versionId)
 	ts.Run(Versioning_CopyObject_success)
 	ts.Run(Versioning_CopyObject_non_existing_version_id)
 	ts.Run(Versioning_CopyObject_from_an_object_version)
+	ts.Run(Versioning_CopyObject_from_a_delete_marker)
+	ts.Run(Versioning_CopyObject_to_itself)
+	ts.Run(Versioning_CopyObject_to_itself_from_the_current_version)
 	if !ts.conf.windowsTests {
 		ts.Run(Versioning_CopyObject_special_chars)
 	}
@@ -1957,7 +1974,10 @@ func TestVersioning(ts *TestState) {
 	}
 	ts.Run(Versioning_HeadObject_invalid_parent)
 	ts.Run(Versioning_HeadObject_success)
+	ts.Run(Versioning_HeadObject_dir_object_versions)
 	ts.Run(Versioning_HeadObject_without_versionId)
+	ts.Run(Versioning_HeadObject_null_version_without_versionId)
+	ts.Run(Versioning_HeadObject_null_versionId_obj)
 	ts.Run(Versioning_HeadObject_delete_marker)
 	// GetObject action
 	ts.Run(Versioning_GetObject_invalid_versionId)
@@ -1966,6 +1986,8 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_GetObject_delete_marker_without_versionId)
 	ts.Run(Versioning_GetObject_delete_marker)
 	ts.Run(Versioning_GetObject_null_versionId_obj)
+	ts.Run(Versioning_GetObject_null_version_without_versionId)
+	ts.Run(Versioning_unversioned_bucket_omits_versionId)
 	// object tagging actions
 	ts.Run(Versioning_PutObjectTagging_invalid_versionId)
 	ts.Run(Versioning_PutObjectTagging_non_existing_object_version)
@@ -1975,6 +1997,7 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_DeleteObjectTagging_invalid_versionId)
 	ts.Run(Versioning_DeleteObjectTagging_non_existing_object_version)
 	ts.Run(Versioning_PutGetDeleteObjectTagging_success)
+	ts.Run(Versioning_ObjectTagging_trailing_slash_counterpart)
 	// GetObjectAttributes action
 	ts.Run(Versioning_GetObjectAttributes_invalid_versionId)
 	ts.Run(Versioning_GetObjectAttributes_object_version)
@@ -1982,9 +2005,14 @@ func TestVersioning(ts *TestState) {
 	// DeleteObject actions
 	ts.Run(Versioning_DeleteObject_invalid_versionId)
 	ts.Run(Versioning_DeleteObject_delete_object_version)
+	ts.Run(Versioning_DeleteObject_dir_object_latest_version)
+	ts.Run(Versioning_DeleteObject_latest_version_with_null_version)
 	ts.Run(Versioning_DeleteObject_non_existing_object)
+	ts.Run(Versioning_DeleteObject_implicit_dir)
+	ts.Run(Versioning_DeleteObject_trailing_slash_counterpart)
 	if !ts.conf.windowsTests {
 		ts.Run(Versioning_DeleteObject_delete_a_delete_marker)
+		ts.Run(Versioning_DeleteObject_dir_object_with_children)
 	}
 	ts.Run(Versioning_Delete_null_versionId_object)
 	ts.Run(Versioning_DeleteObject_nested_dir_object)
@@ -1997,6 +2025,7 @@ func TestVersioning(ts *TestState) {
 	ts.Run(ListObjectVersions_negative_max_keys)
 	ts.Run(ListObjectVersions_list_single_object_versions)
 	ts.Run(ListObjectVersions_list_multiple_object_versions)
+	ts.Run(ListObjectVersions_dir_object_with_children)
 	ts.Run(ListObjectVersions_multiple_object_versions_truncated)
 	ts.Run(ListObjectVersions_with_delete_markers)
 	ts.Run(ListObjectVersions_containing_null_versionId_obj)
@@ -2009,6 +2038,7 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_UploadPartCopy_encoded_versionid_separator_invalid_versionId)
 	ts.Run(Versioning_UploadPartCopy_non_existing_versionId)
 	ts.Run(Versioning_UploadPartCopy_from_an_object_version)
+	ts.Run(Versioning_UploadPartCopy_from_a_delete_marker)
 	// Object lock configuration
 	ts.Run(Versioning_object_lock_not_enabled_on_bucket_creation)
 	ts.Run(Versioning_Enable_object_lock)
@@ -2029,6 +2059,7 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_Put_GetObjectLegalHold_success)
 	// WORM protection
 	ts.Run(Versioning_WORM_obj_version_locked_with_legal_hold)
+	ts.Run(Versioning_WORM_dir_object_lock_headers)
 	ts.Run(Versioning_WORM_obj_version_locked_with_governance_retention)
 	ts.Run(Versioning_WORM_obj_version_locked_with_compliance_retention)
 	ts.Run(Versioning_WORM_delete_marker_locked_object_legal_hold)
@@ -2036,10 +2067,13 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_WORM_delete_marker_locked_object_compliance_retention)
 	ts.Run(Versioning_WORM_PutObject_overwrite_locked_object)
 	ts.Run(Versioning_WORM_CopyObject_overwrite_locked_object)
+	ts.Run(Versioning_WORM_CopyObject_to_itself_locked_object)
 	ts.Run(Versioning_WORM_CompleteMultipartUpload_overwrite_locked_object)
 	if !ts.conf.windowsTests {
 		ts.Run(Versioning_WORM_remove_delete_marker_under_bucket_default_retention)
 	}
+	ts.Run(Versioning_WORM_trailing_slash_counterpart)
+	ts.Run(Versioning_WORM_null_version_locked_with_legal_hold)
 	// Concurrent requests
 	// Versioninig_concurrent_upload_object
 	ts.Run(Versioning_AccessControl_GetObjectVersion)
@@ -2121,6 +2155,7 @@ func TestUnsignedStreaminPayloadTrailer(ts *TestState) {
 		ts.Run(UnsignedStreamingPayloadTrailer_multiple_checksum_headers)
 		ts.Run(UnsignedStreamingPayloadTrailer_sdk_algo_and_trailer_mismatch)
 		ts.Run(UnsignedStreamingPayloadTrailer_incomplete_body)
+		ts.Run(UnsignedStreamingPayloadTrailer_aborted_connection)
 		ts.Run(UnsignedStreamingPayloadTrailer_invalid_chunk_size)
 		ts.Run(UnsignedStreamingPayloadTrailer_content_length_payload_size_mismatch)
 		ts.Run(UnsignedStreamingPayloadTrailer_no_trailer_should_calculate_crc64nvme)
@@ -2867,6 +2902,9 @@ func GetIntTests() IntTests {
 		"GetBucketLocation_no_access":                                                      GetBucketLocation_no_access,
 		"PutObject_non_existing_bucket":                                                    PutObject_non_existing_bucket,
 		"PutObject_special_chars":                                                          PutObject_special_chars,
+		"PutObject_aborted_plain_body":                                                     PutObject_aborted_plain_body,
+		"PutObject_plain_body_with_decoded_length":                                         PutObject_plain_body_with_decoded_length,
+		"UploadPart_plain_body_with_decoded_length":                                        UploadPart_plain_body_with_decoded_length,
 		"PutObject_tagging":                                                                PutObject_tagging,
 		"PutObject_success":                                                                PutObject_success,
 		"PutObject_default_content_type":                                                   PutObject_default_content_type,
@@ -2982,6 +3020,10 @@ func GetIntTests() IntTests {
 		"DeleteObject_name_too_long":                                                       DeleteObject_name_too_long,
 		"CopyObject_overwrite_same_dir_object":                                             CopyObject_overwrite_same_dir_object,
 		"CopyObject_overwrite_same_file_object":                                            CopyObject_overwrite_same_file_object,
+		"CompleteMultipartUpload_overwrite_dir_obj":                                        CompleteMultipartUpload_overwrite_dir_obj,
+		"CompleteMultipartUpload_overwrite_dir_obj_delete_marker":                          CompleteMultipartUpload_overwrite_dir_obj_delete_marker,
+		"ObjectTagging_trailing_slash_counterpart":                                         ObjectTagging_trailing_slash_counterpart,
+		"ObjectLock_trailing_slash_counterpart":                                            ObjectLock_trailing_slash_counterpart,
 		"DeleteObject_non_existing_dir_object":                                             DeleteObject_non_existing_dir_object,
 		"DeleteObject_directory_object":                                                    DeleteObject_directory_object,
 		"DeleteObject_success":                                                             DeleteObject_success,
@@ -3235,6 +3277,7 @@ func GetIntTests() IntTests {
 		"PutBucketCors_success":                                                            PutBucketCors_success,
 		"PutBucketWebsite_non_existing_bucket":                                             PutBucketWebsite_non_existing_bucket,
 		"PutBucketWebsite_empty_suffix":                                                    PutBucketWebsite_empty_suffix,
+		"PutBucketWebsite_empty_configuration":                                             PutBucketWebsite_empty_configuration,
 		"PutBucketWebsite_suffix_with_slash":                                               PutBucketWebsite_suffix_with_slash,
 		"PutBucketWebsite_invalid_redirect_protocol":                                       PutBucketWebsite_invalid_redirect_protocol,
 		"PutBucketWebsite_redirectAll_index_error_routingRules":                            PutBucketWebsite_redirectAll_index_error_routingRules,
@@ -3464,23 +3507,32 @@ func GetIntTests() IntTests {
 		"Versioning_PutObject_null_versionId_obj":                                          Versioning_PutObject_null_versionId_obj,
 		"Versioning_PutObject_overwrite_null_versionId_obj":                                Versioning_PutObject_overwrite_null_versionId_obj,
 		"Versioning_PutObject_success":                                                     Versioning_PutObject_success,
+		"Versioning_PutObject_dir_object_new_version_resets_attributes":                    Versioning_PutObject_dir_object_new_version_resets_attributes,
 		"Versioning_CopyObject_invalid_versionId":                                          Versioning_CopyObject_invalid_versionId,
 		"Versioning_CopyObject_encoded_versionid_separator_invalid_versionId":              Versioning_CopyObject_encoded_versionid_separator_invalid_versionId,
 		"Versioning_CopyObject_success":                                                    Versioning_CopyObject_success,
 		"Versioning_CopyObject_non_existing_version_id":                                    Versioning_CopyObject_non_existing_version_id,
 		"Versioning_CopyObject_from_an_object_version":                                     Versioning_CopyObject_from_an_object_version,
+		"Versioning_CopyObject_from_a_delete_marker":                                       Versioning_CopyObject_from_a_delete_marker,
+		"Versioning_CopyObject_to_itself":                                                  Versioning_CopyObject_to_itself,
+		"Versioning_CopyObject_to_itself_from_the_current_version":                         Versioning_CopyObject_to_itself_from_the_current_version,
 		"Versioning_CopyObject_special_chars":                                              Versioning_CopyObject_special_chars,
 		"Versioning_HeadObject_invalid_versionId":                                          Versioning_HeadObject_invalid_versionId,
 		"Versioning_HeadObject_non_existing_object_version":                                Versioning_HeadObject_non_existing_object_version,
 		"Versioning_HeadObject_invalid_parent":                                             Versioning_HeadObject_invalid_parent,
 		"Versioning_HeadObject_success":                                                    Versioning_HeadObject_success,
+		"Versioning_HeadObject_dir_object_versions":                                        Versioning_HeadObject_dir_object_versions,
 		"Versioning_HeadObject_without_versionId":                                          Versioning_HeadObject_without_versionId,
+		"Versioning_HeadObject_null_versionId_obj":                                         Versioning_HeadObject_null_versionId_obj,
+		"Versioning_HeadObject_null_version_without_versionId":                             Versioning_HeadObject_null_version_without_versionId,
 		"Versioning_HeadObject_delete_marker":                                              Versioning_HeadObject_delete_marker,
 		"Versioning_GetObject_invalid_versionId":                                           Versioning_GetObject_invalid_versionId,
 		"Versioning_GetObject_non_existing_object_version":                                 Versioning_GetObject_non_existing_object_version,
 		"Versioning_GetObject_success":                                                     Versioning_GetObject_success,
 		"Versioning_GetObject_delete_marker_without_versionId":                             Versioning_GetObject_delete_marker_without_versionId,
 		"Versioning_GetObject_delete_marker":                                               Versioning_GetObject_delete_marker,
+		"Versioning_unversioned_bucket_omits_versionId":                                    Versioning_unversioned_bucket_omits_versionId,
+		"Versioning_GetObject_null_version_without_versionId":                              Versioning_GetObject_null_version_without_versionId,
 		"Versioning_GetObject_null_versionId_obj":                                          Versioning_GetObject_null_versionId_obj,
 		"Versioning_PutObjectTagging_invalid_versionId":                                    Versioning_PutObjectTagging_invalid_versionId,
 		"Versioning_PutObjectTagging_non_existing_object_version":                          Versioning_PutObjectTagging_non_existing_object_version,
@@ -3490,13 +3542,19 @@ func GetIntTests() IntTests {
 		"Versioning_DeleteObjectTagging_invalid_versionId":                                 Versioning_DeleteObjectTagging_invalid_versionId,
 		"Versioning_DeleteObjectTagging_non_existing_object_version":                       Versioning_DeleteObjectTagging_non_existing_object_version,
 		"Versioning_PutGetDeleteObjectTagging_success":                                     Versioning_PutGetDeleteObjectTagging_success,
+		"Versioning_ObjectTagging_trailing_slash_counterpart":                              Versioning_ObjectTagging_trailing_slash_counterpart,
 		"Versioning_GetObjectAttributes_invalid_versionId":                                 Versioning_GetObjectAttributes_invalid_versionId,
 		"Versioning_GetObjectAttributes_object_version":                                    Versioning_GetObjectAttributes_object_version,
 		"Versioning_GetObjectAttributes_delete_marker":                                     Versioning_GetObjectAttributes_delete_marker,
 		"Versioning_DeleteObject_invalid_versionId":                                        Versioning_DeleteObject_invalid_versionId,
 		"Versioning_DeleteObject_delete_object_version":                                    Versioning_DeleteObject_delete_object_version,
+		"Versioning_DeleteObject_latest_version_with_null_version":                         Versioning_DeleteObject_latest_version_with_null_version,
+		"Versioning_DeleteObject_dir_object_latest_version":                                Versioning_DeleteObject_dir_object_latest_version,
 		"Versioning_DeleteObject_non_existing_object":                                      Versioning_DeleteObject_non_existing_object,
+		"Versioning_DeleteObject_implicit_dir":                                             Versioning_DeleteObject_implicit_dir,
+		"Versioning_DeleteObject_trailing_slash_counterpart":                               Versioning_DeleteObject_trailing_slash_counterpart,
 		"Versioning_DeleteObject_delete_a_delete_marker":                                   Versioning_DeleteObject_delete_a_delete_marker,
+		"Versioning_DeleteObject_dir_object_with_children":                                 Versioning_DeleteObject_dir_object_with_children,
 		"Versioning_Delete_null_versionId_object":                                          Versioning_Delete_null_versionId_object,
 		"Versioning_DeleteObject_nested_dir_object":                                        Versioning_DeleteObject_nested_dir_object,
 		"Versioning_DeleteObject_non_existing_objects":                                     Versioning_DeleteObject_non_existing_objects,
@@ -3507,6 +3565,7 @@ func GetIntTests() IntTests {
 		"ListObjectVersions_negative_max_keys":                                             ListObjectVersions_negative_max_keys,
 		"ListObjectVersions_list_single_object_versions":                                   ListObjectVersions_list_single_object_versions,
 		"ListObjectVersions_list_multiple_object_versions":                                 ListObjectVersions_list_multiple_object_versions,
+		"ListObjectVersions_dir_object_with_children":                                      ListObjectVersions_dir_object_with_children,
 		"ListObjectVersions_multiple_object_versions_truncated":                            ListObjectVersions_multiple_object_versions_truncated,
 		"ListObjectVersions_with_delete_markers":                                           ListObjectVersions_with_delete_markers,
 		"ListObjectVersions_containing_null_versionId_obj":                                 ListObjectVersions_containing_null_versionId_obj,
@@ -3518,6 +3577,7 @@ func GetIntTests() IntTests {
 		"Versioning_UploadPartCopy_encoded_versionid_separator_invalid_versionId":          Versioning_UploadPartCopy_encoded_versionid_separator_invalid_versionId,
 		"Versioning_UploadPartCopy_non_existing_versionId":                                 Versioning_UploadPartCopy_non_existing_versionId,
 		"Versioning_UploadPartCopy_from_an_object_version":                                 Versioning_UploadPartCopy_from_an_object_version,
+		"Versioning_UploadPartCopy_from_a_delete_marker":                                   Versioning_UploadPartCopy_from_a_delete_marker,
 		"Versioning_object_lock_not_enabled_on_bucket_creation":                            Versioning_object_lock_not_enabled_on_bucket_creation,
 		"Versioning_Enable_object_lock":                                                    Versioning_Enable_object_lock,
 		"Versioning_status_switch_to_suspended_with_object_lock":                           Versioning_status_switch_to_suspended_with_object_lock,
@@ -3534,6 +3594,7 @@ func GetIntTests() IntTests {
 		"Versioning_PutGetObjectLegalHold_delete_marker":                                   Versioning_PutGetObjectLegalHold_delete_marker,
 		"Versioning_Put_GetObjectLegalHold_success":                                        Versioning_Put_GetObjectLegalHold_success,
 		"Versioning_WORM_obj_version_locked_with_legal_hold":                               Versioning_WORM_obj_version_locked_with_legal_hold,
+		"Versioning_WORM_dir_object_lock_headers":                                          Versioning_WORM_dir_object_lock_headers,
 		"Versioning_WORM_obj_version_locked_with_governance_retention":                     Versioning_WORM_obj_version_locked_with_governance_retention,
 		"Versioning_WORM_obj_version_locked_with_compliance_retention":                     Versioning_WORM_obj_version_locked_with_compliance_retention,
 		"Versioning_WORM_delete_marker_locked_object_legal_hold":                           Versioning_WORM_delete_marker_locked_object_legal_hold,
@@ -3541,8 +3602,11 @@ func GetIntTests() IntTests {
 		"Versioning_WORM_delete_marker_locked_object_compliance_retention":                 Versioning_WORM_delete_marker_locked_object_compliance_retention,
 		"Versioning_WORM_PutObject_overwrite_locked_object":                                Versioning_WORM_PutObject_overwrite_locked_object,
 		"Versioning_WORM_CopyObject_overwrite_locked_object":                               Versioning_WORM_CopyObject_overwrite_locked_object,
+		"Versioning_WORM_CopyObject_to_itself_locked_object":                               Versioning_WORM_CopyObject_to_itself_locked_object,
 		"Versioning_WORM_CompleteMultipartUpload_overwrite_locked_object":                  Versioning_WORM_CompleteMultipartUpload_overwrite_locked_object,
 		"Versioning_WORM_remove_delete_marker_under_bucket_default_retention":              Versioning_WORM_remove_delete_marker_under_bucket_default_retention,
+		"Versioning_WORM_trailing_slash_counterpart":                                       Versioning_WORM_trailing_slash_counterpart,
+		"Versioning_WORM_null_version_locked_with_legal_hold":                              Versioning_WORM_null_version_locked_with_legal_hold,
 		"Versioning_AccessControl_GetObjectVersion":                                        Versioning_AccessControl_GetObjectVersion,
 		"Versioning_AccessControl_HeadObjectVersion":                                       Versioning_AccessControl_HeadObjectVersion,
 		"Versioning_AccessControl_object_tagging_policy":                                   Versioning_AccessControl_object_tagging_policy,
@@ -3557,6 +3621,7 @@ func GetIntTests() IntTests {
 		"RouterCopySourceNotAllowed":                                                       RouterCopySourceNotAllowed,
 		"RouterListVersionsWithKey":                                                        RouterListVersionsWithKey,
 		"UnsignedStreaminPayloadTrailer_malformed_trailer":                                 UnsignedStreaminPayloadTrailer_malformed_trailer,
+		"UnsignedStreamingPayloadTrailer_aborted_connection":                               UnsignedStreamingPayloadTrailer_aborted_connection,
 		"UnsignedStreamingPayloadTrailer_missing_invalid_dec_content_length":               UnsignedStreamingPayloadTrailer_missing_invalid_dec_content_length,
 		"UnsignedStreamingPayloadTrailer_invalid_trailing_checksum":                        UnsignedStreamingPayloadTrailer_invalid_trailing_checksum,
 		"UnsignedStreamingPayloadTrailer_incorrect_trailing_checksum":                      UnsignedStreamingPayloadTrailer_incorrect_trailing_checksum,

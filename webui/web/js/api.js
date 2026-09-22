@@ -124,6 +124,7 @@ class VersityAPI {
     this._hasIAM = false;       // Credentials validate against the IAM service
     this._hasS3 = false;        // Credentials validate against the S3 data plane
     this._canListBuckets = false; // hasS3 is true and s3:ListAllMyBuckets is allowed
+    this._canManageGatewayUsers = true; // False when the gateway runs in single-user mode
   }
 
   /**
@@ -296,6 +297,21 @@ class VersityAPI {
   }
 
   /**
+   * Check whether this gateway supports its account-management Admin API.
+   */
+  canManageGatewayUsers() {
+    return this._canManageGatewayUsers;
+  }
+
+  /**
+   * Record whether the gateway supports its account-management Admin API.
+   */
+  setCanManageGatewayUsers(canManageGatewayUsers) {
+    this._canManageGatewayUsers = !!canManageGatewayUsers;
+    sessionStorage.setItem('vgw_can_manage_gateway_users', this._canManageGatewayUsers ? 'true' : 'false');
+  }
+
+  /**
    * Load credentials from sessionStorage
    */
   loadCredentials() {
@@ -310,6 +326,7 @@ class VersityAPI {
     const hasIAM = sessionStorage.getItem('vgw_has_iam') === 'true';
     const hasS3 = sessionStorage.getItem('vgw_has_s3') === 'true';
     const canListBuckets = sessionStorage.getItem('vgw_can_list_buckets') === 'true';
+    const canManageGatewayUsers = sessionStorage.getItem('vgw_can_manage_gateway_users') !== 'false';
 
     // Support legacy single endpoint storage
     const legacyEndpoint = sessionStorage.getItem('vgw_endpoint');
@@ -325,6 +342,7 @@ class VersityAPI {
       this._hasIAM = hasIAM;
       this._hasS3 = hasS3;
       this._canListBuckets = canListBuckets;
+      this._canManageGatewayUsers = canManageGatewayUsers;
       return true;
     }
     return false;
@@ -343,6 +361,7 @@ class VersityAPI {
     this._hasIAM = false;
     this._hasS3 = false;
     this._canListBuckets = false;
+    this._canManageGatewayUsers = true;
     this._userType = 'user';
     this._accessibleGateways = [];
     sessionStorage.removeItem('vgw_admin_endpoint');
@@ -357,6 +376,7 @@ class VersityAPI {
     sessionStorage.removeItem('vgw_has_iam');
     sessionStorage.removeItem('vgw_has_s3');
     sessionStorage.removeItem('vgw_can_list_buckets');
+    sessionStorage.removeItem('vgw_can_manage_gateway_users');
     sessionStorage.removeItem('vgw_iam_probe_error');
     sessionStorage.removeItem('vgw_user_type');
     sessionStorage.removeItem('vgw_accessible_gateways');
@@ -857,7 +877,9 @@ class VersityAPI {
     const responseText = await response.text();
 
     if (!response.ok) {
-      throw new Error(parseXmlErrorMessage(responseText, `HTTP ${response.status}: ${response.statusText}`));
+      const error = new Error(parseXmlErrorMessage(responseText, `HTTP ${response.status}: ${response.statusText}`));
+      error.code = parseXmlErrorCode(responseText);
+      throw error;
     }
 
     return responseText;
@@ -1373,7 +1395,7 @@ class VersityAPI {
   /**
    * Upload an object (PutObject) - for small files < 5MB
    */
-  async putObject(bucket, key, file, contentType = null) {
+  async putObject(bucket, key, file, contentType = null, signal = undefined) {
     const finalContentType = contentType || file.type || 'application/octet-stream';
     const path = `/${bucket}/${encodeS3Key(key)}`;
 
@@ -1386,6 +1408,7 @@ class VersityAPI {
       method: 'PUT',
       headers: signed.headers,
       body: file,
+      signal,
     });
 
     if (!response.ok) {
@@ -1563,12 +1586,13 @@ class VersityAPI {
    * Initiate a multipart upload
    * Returns uploadId needed for subsequent parts
    */
-  async createMultipartUpload(bucket, key, contentType = 'application/octet-stream') {
+  async createMultipartUpload(bucket, key, contentType = 'application/octet-stream', signal = undefined) {
     const fetchParams = await this.buildFetchParams('POST', `/${bucket}/${encodeS3Key(key)}`, { uploads: '' }, '', false, contentType);
 
     const response = await fetch(fetchParams.url, {
       method: 'POST',
       headers: fetchParams.headers,
+      signal,
     });
 
     if (!response.ok) {
@@ -1592,7 +1616,7 @@ class VersityAPI {
    * Upload a single part of a multipart upload
    * Returns ETag needed for CompleteMultipartUpload
    */
-  async uploadPart(bucket, key, uploadId, partNumber, data) {
+  async uploadPart(bucket, key, uploadId, partNumber, data, signal = undefined) {
     const arrayBuffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
     const path = `/${bucket}/${encodeS3Key(key)}`;
     const queryParams = {
@@ -1613,6 +1637,7 @@ class VersityAPI {
       method: 'PUT',
       headers: signed.headers,
       body: arrayBuffer,
+      signal,
     });
 
     if (!response.ok) {
@@ -1647,7 +1672,7 @@ class VersityAPI {
    * Complete a multipart upload
    * parts should be an array of { partNumber, etag }
    */
-  async completeMultipartUpload(bucket, key, uploadId, parts) {
+  async completeMultipartUpload(bucket, key, uploadId, parts, signal = undefined) {
     let body = '<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>';
 
     // Sort parts by partNumber
@@ -1668,6 +1693,7 @@ class VersityAPI {
       method: 'POST',
       headers: fetchParams.headers,
       body: body,
+      signal,
     });
 
     if (!response.ok) {
@@ -2849,6 +2875,18 @@ function parseXmlErrorMessage(responseText, fallback) {
     // Ignore parsing errors and fall through
   }
   return fallback;
+}
+
+/**
+ * Extract an S3-compatible error code from an XML response body.
+ */
+function parseXmlErrorCode(responseText) {
+  try {
+    const xmlDoc = new DOMParser().parseFromString(responseText, 'text/xml');
+    return xmlDoc.querySelector('Code')?.textContent || null;
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
