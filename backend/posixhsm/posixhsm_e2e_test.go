@@ -31,6 +31,7 @@ import (
 	"github.com/versity/versitygw/backend/meta"
 	"github.com/versity/versitygw/backend/posix"
 	"github.com/versity/versitygw/backend/posixhsm/queue"
+	"github.com/versity/versitygw/backend/posixhsm/state"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -39,6 +40,19 @@ import (
 // wraps it with PosixHsm so the tests exercise the actual posix code paths
 // (put/get/list/head/copy) alongside the HSM overrides.
 func setupBackend(t *testing.T) (*PosixHsm, string, func()) {
+	t.Helper()
+	h, rootdir, _, cleanup := setupBackendStore(t, false)
+	return h, rootdir, cleanup
+}
+
+// setupBackendStore builds the same stack; with sidecar=true the
+// representation is the split-file one (metadata in <sidecar>/<bucket>/<key>/
+// meta/ files, nothing on the object inode). The second return value of the
+// daemonStorer — when sidecar — is a storer addressing the SAME sidecar dir
+// the way vgwtaped does (absolute object paths via PathRelStorer), so tests
+// can simulate daemon-side state writes with the real cross-process
+// addressing.
+func setupBackendStore(t *testing.T, sidecar bool) (*PosixHsm, string, meta.MetadataStorer, func()) {
 	t.Helper()
 	base := t.TempDir()
 	rootdir := filepath.Join(base, "root")
@@ -50,12 +64,27 @@ func setupBackend(t *testing.T) (*PosixHsm, string, func()) {
 	// Note: posix.New chdirs into rootdir by default; that's the state in
 	// which the gateway runs too.
 
-	ms := meta.XattrMeta{}
-	p, err := posix.New(rootdir, ms, posix.PosixOpts{
+	var ms meta.MetadataStorer = meta.XattrMeta{}
+	opts := posix.PosixOpts{
 		NewDirPerm:  0o755,
 		NewFilePerm: 0o644,
 		Concurrency: 50,
-	})
+	}
+	var daemonStorer meta.MetadataStorer
+	if sidecar {
+		sd := filepath.Join(base, "sidecar")
+		if err := os.MkdirAll(sd, 0o755); err != nil {
+			t.Fatalf("mkdir sidecar: %v", err)
+		}
+		sc, err := meta.NewSideCar(sd)
+		if err != nil {
+			t.Fatalf("new sidecar: %v", err)
+		}
+		ms = sc
+		opts.SideCarDir = sd
+		daemonStorer = state.NewPathRelStorer(sc, rootdir)
+	}
+	p, err := posix.New(rootdir, ms, opts)
 	if err != nil {
 		// posix.New fails when the FS does not support xattr. On CI
 		// (macOS APFS, tmpfs, some btrfs configs) this can happen; the
@@ -74,7 +103,7 @@ func setupBackend(t *testing.T) (*PosixHsm, string, func()) {
 	cleanup := func() {
 		_ = os.RemoveAll(base)
 	}
-	return h, rootdir, cleanup
+	return h, rootdir, daemonStorer, cleanup
 }
 
 // putObject creates bucket + object on the wrapped backend, mirroring the
@@ -270,4 +299,104 @@ func collect(t *testing.T, r interface{ Read([]byte) (int, error) }) []byte {
 		t.Fatalf("read body: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// TestGlacierOfflineSemanticsSidecar runs the offline/restore semantics with
+// the split-file (sidecar) metadata representation. The simulated daemon
+// writes state the way vgwtaped does — absolute object paths through
+// PathRelStorer — while the gateway reads/writes its own state through the
+// raw storer with root-relative names. The test asserts both address the
+// same sidecar files: that bridge is what makes the two processes agree.
+func TestGlacierOfflineSemanticsSidecar(t *testing.T) {
+	h, rootdir, daemonStorer, cleanup := setupBackendStore(t, true)
+	defer cleanup()
+	if daemonStorer == nil {
+		t.Fatal("expected daemon storer for sidecar setup")
+	}
+
+	const (
+		bucket = "sc-bucket"
+		key    = "object.bin"
+	)
+	body := []byte("sidecar-glacier-payload")
+	putObject(t, h, rootdir, bucket, key, body)
+
+	// --- daemon tiers the object (absolute-path addressing) ---
+	obj := filepath.Join(rootdir, bucket, key)
+	if err := state.SetOffline(daemonStorer, obj, "mock:"+obj+":0:"+fmt.Sprint(len(body)), int64(len(body))); err != nil {
+		t.Fatalf("daemon set-offline: %v", err)
+	}
+	if err := os.Truncate(obj, 0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	// --- gateway (root-relative addressing) sees GLACIER ---
+	hh, err := h.HeadObject(ctxT(), &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		t.Fatalf("head post-tier: %v", err)
+	}
+	if hh.StorageClass != types.StorageClassGlacier {
+		t.Fatalf("expected GLACIER, got %q", hh.StorageClass)
+	}
+	if hh.ContentLength == nil || *hh.ContentLength != int64(len(body)) {
+		t.Fatalf("expected reported size %d, got %v", len(body), hh.ContentLength)
+	}
+
+	_, err = h.GetObject(ctxT(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidObjectState" {
+		t.Fatalf("expected InvalidObjectState, got %v", err)
+	}
+
+	// --- gateway enqueues + marks restoring; daemon-side reader sees it ---
+	if err := h.RestoreObject(ctxT(), &s3.RestoreObjectInput{
+		Bucket:         aws.String(bucket),
+		Key:            aws.String(key),
+		RestoreRequest: &types.RestoreRequest{Days: aws.Int32(1)},
+	}); err != nil {
+		t.Fatalf("restore object: %v", err)
+	}
+	if st := state.Store(daemonStorer, obj); !st.Offline || !st.Restoring {
+		t.Fatalf("daemon-side state after gateway restore request: %+v", st)
+	}
+
+	// --- daemon completes the restore (absolute path again) ---
+	if err := os.WriteFile(obj, body, 0o644); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	if err := state.ClearOffline(daemonStorer, obj); err != nil {
+		t.Fatalf("daemon clear-offline: %v", err)
+	}
+
+	// --- gateway serves the original bytes again ---
+	got, err := h.GetObject(ctxT(), &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		t.Fatalf("get post-restore: %v", err)
+	}
+	if all := collect(t, got.Body); string(all) != string(body) {
+		t.Fatalf("body mismatch after restore: got %q", all)
+	}
+
+	// --- on-disk layout: state under <sidecar>/<bucket>/<key>/meta/, never
+	// a doubled-up absolute path, and nothing as xattr on the object.
+	base := filepath.Dir(rootdir)
+	metaDir := filepath.Join(base, "sidecar", bucket, key, "meta")
+	if _, err := os.Stat(filepath.Join(metaDir, "hsm-loc")); err != nil {
+		t.Fatalf("expected %s/hsm-loc: %v", metaDir, err)
+	}
+	if doubled := filepath.Join(base, "sidecar", rootdir); dirExists(doubled) {
+		t.Fatalf("sidecar doubled the absolute root: %s", doubled)
+	}
+	if attrs, err := (&meta.XattrMeta{}).ListAttributes(obj, ""); err == nil {
+		for _, a := range attrs {
+			if strings.HasPrefix(a, "hsm-") {
+				t.Fatalf("hsm state leaked to xattr on %s: %v", obj, attrs)
+			}
+		}
+	}
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }

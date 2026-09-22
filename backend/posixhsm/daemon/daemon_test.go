@@ -35,6 +35,35 @@ import (
 func setup(t *testing.T, now time.Time) (*Daemon, string, string) {
 	t.Helper()
 	base := t.TempDir()
+	return setupWithStore(t, now, base, nil)
+}
+
+// setupSidecar wires the same tree and daemon, but HSM state lives in
+// sidecar metadata files (the split representation). The storer is built
+// exactly like cmd/vgwtaped does it: meta.NewSideCar wrapped in
+// PathRelStorer, because the daemon addresses state by absolute path while
+// the gateway (and SideCar itself) use root-relative names. Returns the
+// sidecar dir alongside the daemon.
+func setupSidecar(t *testing.T, now time.Time) (*Daemon, string, string, string) {
+	t.Helper()
+	base := t.TempDir()
+	sidecar := filepath.Join(base, "sidecar")
+	if err := os.MkdirAll(sidecar, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inner, err := meta.NewSideCar(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := state.NewPathRelStorer(inner, filepath.Join(base, "root"))
+	d, rootdir, obj := setupWithStore(t, now, base, ms)
+	return d, rootdir, obj, sidecar
+}
+
+// setupWithStore builds the tree under base; a nil storer means xattrs on
+// the object files (the default posix representation).
+func setupWithStore(t *testing.T, now time.Time, base string, ms meta.MetadataStorer) (*Daemon, string, string) {
+	t.Helper()
 	rootdir := filepath.Join(base, "root")
 	statedir := filepath.Join(base, "state")
 	const bucket = "bkt"
@@ -51,7 +80,9 @@ func setup(t *testing.T, now time.Time) (*Daemon, string, string) {
 	old := now.Add(-2 * time.Hour)
 	_ = os.Chtimes(obj, old, old)
 
-	meta := meta.XattrMeta{}
+	if ms == nil {
+		ms = meta.XattrMeta{}
+	}
 	q, err := queue.New(statedir)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +98,7 @@ func setup(t *testing.T, now time.Time) (*Daemon, string, string) {
 	d := New(Config{
 		Driver:   drv,
 		Queue:    q,
-		Meta:     meta,
+		Meta:     ms,
 		Policy:   pol,
 		Lister:   list,
 		WaveSize: 10,
@@ -79,7 +110,41 @@ func setup(t *testing.T, now time.Time) (*Daemon, string, string) {
 func TestDaemonGlacierWorkflow(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	d, rootdir, obj := setup(t, now)
+	runGlacierWorkflow(t, d, now, obj)
+	_ = rootdir // rootdir kept for potential future assertions
+}
 
+// TestDaemonGlacierWorkflowSidecar runs the identical workflow with the
+// split-file (sidecar) metadata representation; on top of the flow checks
+// it asserts where the metadata actually lands on disk.
+func TestDaemonGlacierWorkflowSidecar(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	d, rootdir, obj, sidecar := setupSidecar(t, now)
+	runGlacierWorkflow(t, d, now, obj)
+
+	// metadata lives under the sidecar dir, never as an xattr or as a
+	// doubled-up absolute path on the object file.
+	marker := filepath.Join(sidecar, "bkt", "object.bin", "meta", "hsm-loc")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected sidecar locator at %s: %v", marker, err)
+	}
+	if got := filepath.Base(filepath.Dir(filepath.Dir(marker))); got != "object.bin" {
+		t.Fatalf("unexpected sidecar layout: %s", marker)
+	}
+	if doubled := filepath.Join(sidecar, rootdir, "bkt"); dirExists(doubled) {
+		t.Fatalf("sidecar path doubled rootdir: %s exists", doubled)
+	}
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// runGlacierWorkflow drives Tier → RestoreJobs → Sweep over one eligible
+// object, independent of the metadata representation.
+func runGlacierWorkflow(t *testing.T, d *Daemon, now time.Time, obj string) {
+	t.Helper()
 	ctx := context.Background()
 
 	// ---- 1) tier the object ----
@@ -161,8 +226,6 @@ func TestDaemonGlacierWorkflow(t *testing.T) {
 	if fi, _ := os.Stat(obj); fi.Size() != 0 {
 		t.Fatalf("expected truncated again after re-tier, size=%d", fi.Size())
 	}
-
-	_ = rootdir // rootdir kept for potential future assertions
 }
 
 func TestDaemonPolicyRespectsMinAge(t *testing.T) {

@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -37,11 +38,13 @@ import (
 	"github.com/versity/versitygw/backend/posixhsm/daemon"
 	"github.com/versity/versitygw/backend/posixhsm/policy"
 	"github.com/versity/versitygw/backend/posixhsm/queue"
+	"github.com/versity/versitygw/backend/posixhsm/state"
 )
 
 var (
 	rootdir        string
 	stateDir       string
+	sidecarDir     string
 	policyPath     string
 	driverName     string
 	bareosClient   string
@@ -99,7 +102,26 @@ func runDaemon(_ *cli.Context) error {
 	// rootdir only when the passed bucket is absolute, and lister-emitted
 	// candidate paths are also used as raw paths by the daemon, so both
 	// must agree on an absolute root.
-	meta := meta.XattrMeta{}.WithRootDir(absRoot)
+	//
+	// The metadata storer must match the gateway's mode: xattr is the
+	// default; --sidecar selects the split-file representation and must
+	// point at the SAME sidecar directory the gateway was started with.
+	ms := meta.XattrMeta{}.WithRootDir(absRoot)
+	if sidecarDir != "" {
+		absSidecar, serr := filepath.Abs(sidecarDir)
+		if serr != nil {
+			return fmt.Errorf("resolve sidecar dir: %w", serr)
+		}
+		if absSidecar == absRoot || strings.HasPrefix(absSidecar, absRoot+string(filepath.Separator)) {
+			return fmt.Errorf("--sidecar %q must not be inside --rootdir %q (the daemon would tier its own metadata)", absSidecar, absRoot)
+		}
+		sc, serr := meta.NewSideCar(absSidecar)
+		if serr != nil {
+			return fmt.Errorf("failed to init sidecar metadata: %w", serr)
+		}
+		ms = state.NewPathRelStorer(sc, absRoot)
+		log.Printf("using sidecar directory for metadata: %s", absSidecar)
+	}
 	q, err := queue.New(stateDir)
 	if err != nil {
 		return fmt.Errorf("init queue: %w", err)
@@ -120,7 +142,7 @@ func runDaemon(_ *cli.Context) error {
 	d := daemon.New(daemon.Config{
 		Driver:   drv,
 		Queue:    q,
-		Meta:     meta,
+		Meta:     ms,
 		Policy:   pol,
 		Lister:   lister,
 		WaveSize: 256,
@@ -232,6 +254,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		&cli.StringFlag{Name: "rootdir", Usage: "absolute path to the posix-hsm root directory", EnvVars: []string{"VGWTAPED_ROOTDIR"}, Destination: &rootdir},
 		&cli.StringFlag{Name: "state-dir", Usage: "shared HSM state directory (job queue, driver state)", EnvVars: []string{"VGWTAPED_STATE_DIR"}, Destination: &stateDir},
+		&cli.StringFlag{Name: "sidecar", Usage: "sidecar metadata directory (must equal the gateway's --sidecar, absolute path recommended); default: xattrs on the object files", EnvVars: []string{"VGWTAPED_SIDECAR"}, Destination: &sidecarDir},
 		&cli.StringFlag{Name: "policy", Usage: "path to a tiering policy YAML file", EnvVars: []string{"VGWTAPED_POLICY"}, Destination: &policyPath},
 		&cli.StringFlag{Name: "driver", Value: "mock", Usage: "HSM driver: mock (default) or bareos", EnvVars: []string{"VGWTAPED_DRIVER"}, Destination: &driverName},
 		&cli.StringFlag{Name: "bareos-client", Usage: "Bareos Client (File Daemon) resource for this gateway host", EnvVars: []string{"VGWTAPED_BAREOS_CLIENT"}, Destination: &bareosClient},
