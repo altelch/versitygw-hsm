@@ -52,6 +52,7 @@ var (
 	bareosRestore  string
 	bareosConf     string
 	bareosDirector string
+	bareosFilelist string
 	zfsDataset     string
 	wg             sync.WaitGroup
 	workers        int
@@ -65,12 +66,17 @@ func buildDriver() (posixhsm.HsmDriver, error) {
 	case "", "mock":
 		return posixhsm.NewMockDriver(stateDir)
 	case "bareos":
+		filelist := bareosFilelist
+		if filelist == "" {
+			filelist = filepath.Join(stateDir, "hsm-bareos-filelist.txt")
+		}
 		return posixhsm.NewBareosDriver(posixhsm.BareosOpts{
 			Client:         bareosClient,
 			BackupJob:      bareosBackup,
 			RestoreJob:     bareosRestore,
 			BConsoleConfig: bareosConf,
 			Director:       bareosDirector,
+			FileListPath:   filelist,
 		})
 	default:
 		return nil, fmt.Errorf("unknown driver %q (supported: mock, bareos)", driverName)
@@ -258,10 +264,11 @@ func main() {
 		&cli.StringFlag{Name: "policy", Usage: "path to a tiering policy YAML file", EnvVars: []string{"VGWTAPED_POLICY"}, Destination: &policyPath},
 		&cli.StringFlag{Name: "driver", Value: "mock", Usage: "HSM driver: mock (default) or bareos", EnvVars: []string{"VGWTAPED_DRIVER"}, Destination: &driverName},
 		&cli.StringFlag{Name: "bareos-client", Usage: "Bareos Client (File Daemon) resource for this gateway host", EnvVars: []string{"VGWTAPED_BAREOS_CLIENT"}, Destination: &bareosClient},
-		&cli.StringFlag{Name: "bareos-backup", Usage: "name of a Type=Backup Job that archives the tiered objects", EnvVars: []string{"VGWTAPED_BAREOS_BACKUP"}, Destination: &bareosBackup},
+		&cli.StringFlag{Name: "bareos-backup", Usage: "name of a Type=Backup Job (FileSet reads the due-file list, Level=File) that archives the tiered objects", EnvVars: []string{"VGWTAPED_BAREOS_BACKUP"}, Destination: &bareosBackup},
 		&cli.StringFlag{Name: "bareos-restore", Usage: "name of a Type=Restore Job used for in-place single-file restores", EnvVars: []string{"VGWTAPED_BAREOS_RESTORE"}, Destination: &bareosRestore},
 		&cli.StringFlag{Name: "bareos-conf", Usage: "bconsole -c config dir/file (defines the Director to talk to)", EnvVars: []string{"VGWTAPED_BAREOS_CONF"}, Destination: &bareosConf},
 		&cli.StringFlag{Name: "bareos-director", Usage: "bconsole -D directory (named console), optional", EnvVars: []string{"VGWTAPED_BAREOS_DIRECTOR"}, Destination: &bareosDirector},
+		&cli.StringFlag{Name: "bareos-filelist", Usage: "due-file list for the backup job's FileSet (fd must read it; default: <state-dir>/hsm-bareos-filelist.txt)", EnvVars: []string{"VGWTAPED_BAREOS_FILELIST"}, Destination: &bareosFilelist},
 		&cli.StringFlag{Name: "zfs-dataset", Usage: "ZFS dataset name to tier (enables incremental scan via zfs diff; mount point must equal --rootdir)", EnvVars: []string{"VGWTAPED_ZFS_DATASET"}, Destination: &zfsDataset},
 		&cli.IntFlag{Name: "workers", Value: 4, Usage: "number of concurrent restore workers", EnvVars: []string{"VGWTAPED_WORKERS"}, Destination: &workers},
 		&cli.DurationFlag{Name: "scan-interval", Value: 5 * time.Minute, Usage: "interval between tier/sweep/gc passes", EnvVars: []string{"VGWTAPED_SCAN_INTERVAL"}, Destination: &scanInterval},

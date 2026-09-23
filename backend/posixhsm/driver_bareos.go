@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -63,14 +64,26 @@ import (
 //
 //   - A Client resource (Bareos File Daemon) named opts.Client that
 //     corresponds to the host running the posix-hsm gateway.
-//   - A FileSet resource named opts.Fileset that includes the posix-hsm
-//     tree to be backed up.
-//   - A Backup Job (e.g. "HsmBackup") using the above, with the intended
-//     Storage/Pool.  This is what ArchiveWave runs.
+//   - A FileSet whose Include contains `File = "<opts.FileListPath"`,
+//     i.e. it reads the per-pass due-file list the driver writes (one
+//     absolute path per line) instead of pinning a static directory.
+//   - A Backup Job (e.g. "HsmBackup") at `Level = File` using the above,
+//     with the intended Storage/Pool and with NO Schedule or other
+//     trigger (see PROJECT.MD §7 "Job content").  This is what
+//     ArchiveWave runs; its content is exactly the due set.
 //   - A Restore Job (e.g. "HsmRestore") of Type = Restore whose Where
 //     equals the posix rootdir (default for `where` in the restore
 //     command) -- the bareos-fd must restore the file back to its
 //     original location so the live inode + xattrs are preserved.
+//
+// Why the due-file list matters: the job must NOT archive a static
+// directory. After tiering truncates an object to 0 bytes, a
+// changed-since-Incremental run would re-save the 0-byte stub, and a
+// restore would then hand back empty data. The list makes the job content
+// exactly the online, due objects and nothing else. Level=File forces the
+// fd to save each listed file as a full version regardless of mtime/size,
+// so an unchanged-but-listed file is never skipped (the locator pinning a
+// jobid that omits it would be unrecoverable).
 //
 // Bareos has no per-file delete from a written volume; Purge below is
 // therefore best-effort on the catalog (prune files jobid=...), plus a
@@ -99,9 +112,20 @@ type BareosOpts struct {
 	Client string
 
 	// BackupJob is the name of a Type=Backup Job that will archive the
-	// tiered objects (its FileSet resource must include the posix-hsm
-	// tree). Required.
+	// tiered objects. Its FileSet must consume the per-pass due-file list
+	// via `File = "<FileListPath"` and run at `Level = File`, so the job
+	// archive contains exactly the objects the daemon decided to tier.
+	// Required.
 	BackupJob string
+
+	// FileListPath is the file the driver writes the due-file list to
+	// before triggering the backup job (one absolute file path per line).
+	// The FileListPath must reside on the filesystem of the File Daemon
+	// (for single-host setups the usual case, the daemon and the fd share
+	// it), and the fd user must be able to read it. It must be kept out
+	// of the FileSet itself, or the job would archive its own list.
+	// Required.
+	FileListPath string
 
 	// RestoreJob is the name of a Type=Restore Job used to restore a
 	// single file at its original location. Required.
@@ -131,10 +155,11 @@ type BareosHsmDriver struct {
 
 var _ HsmDriver = (*BareosHsmDriver)(nil)
 
-// SingleWave reports true: ArchiveWave runs one Fixed-content Bareos job
-// (run job=<BackupJob>); it does not consume the wave's file list. Splitting
-// the tier set into waves would re-run the same job several times per pass,
-// so the daemon passes the whole due set in a single call.
+// SingleWave reports true: one bareos run cannot split its input list, and
+// re-running the same named job per wave would produce several catalog jobs
+// per pass with no benefit (lookupJobID keys on highest JobId of the name).
+// The daemon therefore passes the whole due set in one ArchiveWave call,
+// which ArchiveWave renders into the fd's file list.
 func (*BareosHsmDriver) SingleWave() bool { return true }
 
 // consoleExec executes a bconsole batch. The command list (without `quit`,
@@ -181,6 +206,9 @@ func NewBareosDriver(o BareosOpts) (*BareosHsmDriver, error) {
 	}
 	if o.RestoreJob == "" {
 		return nil, errors.New("bareos driver: opts.RestoreJob is required (a Type=Restore Job to restore a single file in place)")
+	}
+	if o.FileListPath == "" {
+		return nil, errors.New("bareos driver: opts.FileListPath is required (the due-file list the backup job's FileSet reads via `File = \"< file\"`)")
 	}
 	return newBareosDriverWithExec(o, defaultConsoleExec), nil
 }
@@ -262,69 +290,145 @@ func isOKTermination(tail string) bool {
 		strings.Contains(l, "completed without errors")
 }
 
-// lookupJobID scans the `list jobs` portion of the output for an entry whose
-// name matches jobname, and returns the largest numeric JobId (the most
-// recent run). It accepts both the documented JSON-RPC 2.0 envelope (from
-// `.api 2`) and a legacy text/table form as a best-effort fallback. Because
-// the JSON path is documented, we prefer it; the text fallback relies on
-// the row having the jobid as its first whitespace-separated token and the
-// job name appearing on the same line -- the documented `list jobs` table
-// format uses a fixed column order that places them near the start.
+// lookupJobID scans the batch output for an entry whose name matches
+// jobname and returns the largest numeric JobId (the most recent run).
+//
+// Under the documented `.api 2` mode *every* console command emits its own
+// JSON-RPC 2.0 response object, interleaved with plain-text job reports, so
+// one bconsole batch contains several JSON objects side by side. Extract
+// each top-level object brace-aware, unmarshal them independently, and take
+// the maximum matching JobId. Text fallbacks cover `.api 0/1` output: the
+// `run` report's "Running job: <ujobid> (JobId=N)" line, and plain `list
+// jobs` table rows (JobId column first, name column after).
+var jobIDParenRe = regexp.MustCompile(`\(JobId\s*=\s*(\d+)\)`)
+
+type bareosAPIJob struct {
+	Jobid string `json:"jobid"`
+	Name  string `json:"name"`
+}
+
 func lookupJobID(out []byte, jobname string) int {
-	// Try the JSON-RPC form first:
-	//   {"jsonrpc":"2.0","id":null,"result":{"jobs":[{"jobid":"N","name":"X",...}]}}
-	// The response may be preceded by job-report text, so locate the first
-	// '{' and unmarshal from there.
-	if start := bytes.IndexByte(out, '{'); start >= 0 {
-		type resp struct {
-			Result *struct {
-				Jobs []struct {
-					Jobid string `json:"jobid"`
-					Name  string `json:"name"`
-				} `json:"jobs"`
-			} `json:"result"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
+	type resp struct {
+		Result *struct {
+			Jobs  []bareosAPIJob `json:"jobs"`
+			Jobid string         `json:"jobid"`
+			Name  string         `json:"name"`
+		} `json:"result"`
+	}
+	best := 0
+	for _, obj := range topLevelJSONObjects(out) {
 		var r resp
-		if err := json.Unmarshal(out[start:], &r); err == nil && r.Result != nil && r.Result.Jobs != nil {
-			best := 0
-			for _, j := range r.Result.Jobs {
-				if j.Name != jobname {
-					continue
-				}
+		if err := json.Unmarshal(obj, &r); err != nil || r.Result == nil {
+			continue
+		}
+		for _, j := range r.Result.Jobs {
+			if j.Name == jobname {
 				if n, err := strconv.Atoi(j.Jobid); err == nil && n > best {
 					best = n
 				}
 			}
-			if best > 0 {
-				return best
+		}
+		if r.Result.Name == jobname {
+			if n, err := strconv.Atoi(r.Result.Jobid); err == nil && n > best {
+				best = n
 			}
 		}
+		if best > 0 {
+			break
+		}
 	}
-	// Text fallback: the `list jobs` table starts with "| JobId | ..." rows;
-	// the job NAME is the "Name" column. Best-effort: any line containing
-	// both the name and a plausible leading integer.
+	if best > 0 {
+		return best
+	}
 	rows := strings.Split(string(out), "\n")
-	best := 0
 	for _, raw := range rows {
 		line := strings.TrimSpace(raw)
+		if line == "" || !strings.Contains(line, jobname) {
+			continue
+		}
+		if m := jobIDParenRe.FindStringSubmatch(line); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil && n > best {
+				best = n
+			}
+			continue
+		}
+		// `list jobs` table: JobId is the numeric column, the name a
+		// following column (`| 142 | HsmTierBackup | ...`).
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		first := -1
+		for i, f := range fields {
+			if _, err := strconv.Atoi(f); err == nil {
+				first = i
+				break
+			}
+		}
+		if first < 0 {
 			continue
 		}
-		j, err := strconv.Atoi(fields[0])
-		if err != nil {
+		jobid, err := strconv.Atoi(fields[first])
+		if err != nil || jobid <= best {
 			continue
 		}
-		for _, f := range fields[1:] {
-			if f == jobname && j > best {
-				best = j
+		for _, f := range fields[first+1:] {
+			if f == jobname {
+				best = jobid
+				break
 			}
 		}
 	}
 	return best
+}
+
+// topLevelJSONObjects returns each complete top-level JSON object in b as a
+// separate byte slice. Brace pairs inside string literals are ignored.
+func topLevelJSONObjects(b []byte) [][]byte {
+	var out [][]byte
+	var cur []byte
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case inStr:
+			cur = append(cur, c)
+			switch c {
+			case '\\':
+				esc = true
+			case '"':
+				if !esc {
+					inStr = false
+				}
+				esc = false
+			default:
+				esc = false
+			}
+		case c == '"':
+			inStr = true
+			if depth > 0 {
+				cur = append(cur, c)
+			}
+		case c == '{':
+			if depth == 0 {
+				cur = cur[:0]
+			}
+			depth++
+			cur = append(cur, c)
+		case c == '}':
+			if depth > 0 {
+				depth--
+				cur = append(cur, c)
+				if depth == 0 {
+					out = append(out, append([]byte(nil), cur...))
+				}
+			}
+		default:
+			if depth > 0 {
+				cur = append(cur, c)
+			}
+		}
+	}
+	return out
 }
 
 func truncated(b []byte, n int) string {
@@ -336,13 +440,52 @@ func truncated(b []byte, n int) string {
 
 // --- HsmDriver -----------------------------------------------------------------
 
+// writeFileList atomically rewrites opts.FileListPath with one absolute
+// file path per line (the due set of this wave/pass). The backup job's
+// FileSet reads this file on the fd (`File = "<file")`.
+func (d *BareosHsmDriver) writeFileList(files []WaveFile) error {
+	var b bytes.Buffer
+	b.Grow(len(files) * 64)
+	for _, f := range files {
+		b.WriteString(f.Path)
+		b.WriteByte('\n')
+	}
+
+	dir := filepath.Dir(d.opts.FileListPath)
+	tmp, err := os.CreateTemp(dir, ".hsm-bareos-filelist-*")
+	if err != nil {
+		return fmt.Errorf("bareos driver: create file list %q: %w", d.opts.FileListPath, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(b.Bytes()); err != nil {
+		tmp.Close()
+		return fmt.Errorf("bareos driver: write file list %q: %w", d.opts.FileListPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("bareos driver: close file list %q: %w", d.opts.FileListPath, err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return fmt.Errorf("bareos driver: chmod file list %q: %w", d.opts.FileListPath, err)
+	}
+	if err := os.Rename(tmpName, d.opts.FileListPath); err != nil {
+		return fmt.Errorf("bareos driver: install file list %q: %w", d.opts.FileListPath, err)
+	}
+	return nil
+}
+
 func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]string, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
-	// Bareos archives whatever its Fileset covers. The daemon passes the
-	// tiered objects; we stat them for a sanity check (also surfaces
-	// typos in the fileset config as an early error).
+	if d.opts.FileListPath == "" {
+		return nil, errors.New("bareos driver: FileListPath is not configured; refusing to run a job whose FileSet would archive a stale or static set")
+	}
+	// Sanity check the due set before pinning any state on it: every file
+	// must be a regular file that is present right now (a vanished file
+	// would otherwise make the whole fd job fail on a stale list entry,
+	// which is slower to diagnose than an early error here).
 	for _, f := range files {
 		fi, err := os.Stat(f.Path)
 		if err != nil {
@@ -351,6 +494,15 @@ func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]
 		if !fi.Mode().IsRegular() {
 			return nil, fmt.Errorf("bareos driver: %s is not a regular file", f.Path)
 		}
+	}
+
+	// The job's FileSet reads the per-pass list at FileListPath (`File =
+	// "< file"`) and Level=File saves exactly these files, so a truncate
+	// from an earlier pass can never make it into the archive and no
+	// not-yet-due object rides along. Atomic write (temp + rename) so the
+	// fd can never observe a half-written list.
+	if err := d.writeFileList(files); err != nil {
+		return nil, err
 	}
 
 	// Batch: enable JSON api, run the backup job, wait, drain messages,
