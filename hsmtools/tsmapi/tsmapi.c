@@ -421,6 +421,31 @@ static int queryName(const char *fs, const char *hl, const char *ll)
     return 0;
 }
 
+/*
+ * Version policy — why we do NOT need adsmpipe-style multi-version skip.
+ *
+ * The classic IBM references (callmt1.c, dsmgrp.c) and especially the adsmpipe
+ * reference tool support fetching an *arbitrary* numbered version: they loop
+ * dsmGetNextQObj, feeding a dummy DataBlk until they reach the requested
+ * version_index, and use that single objId as the restore target.
+ *
+ * Our lifecycle model is simpler, so we skip that:
+ *
+ *   - The driver owns exactly ONE live copy of a name at any time:
+ *       `send`  creates a *new* backup copy (new objId, newest insDate).
+ *       `delete` purges *every* active backup version of the name (see
+ *       cmdDelete — we iterate all gNobj entries), which is the semantic
+ *       the Go side wants (locator is "gone" => all physical copies go).
+ *   - There is no user-visible "version N" to select. The only read path is
+ *       `get`, and it always wants the content that is *now* the current
+ *       object, i.e. the newest-insDate copy.
+ *
+ * So "skip to version N" would be dead code: either we restore the newest
+ * one (get) or we delete them all (delete).  Keeping the single `latestIdx`
+ * selection below is both correct for that model and cheaper than the
+ * dummy-Blk loop adsmpipe uses (one less dsmGetNextQObj round-trip per
+ * version we do not need).
+ */
 /* index of the latest version (max insertion date, then objId), -1 if none */
 static int latestIdx(void)
 {
