@@ -254,6 +254,18 @@ static int nameOK(const char **fs, const char **hl, const char **ll)
     return 0;
 }
 
+/* TSM object names require the high- and low-level qualifiers to be
+   directory-delimiter-qualified (ANS0283E/ANS0225E if not). The driver
+   passes bare hl/ll (no leading '/'); this prepends exactly one '/' when
+   absent. An empty hl (top-of-filespace object) stays empty — the ll
+   qualifier then carries the whole path ('/leaf'). */
+static void qualCopy(char *dst, size_t dn, const char *src)
+{
+    if (!*src) { if (dn) dst[0] = '\0'; return; }
+    if (src[0] == '/') { snprintf(dst, dn, "%s", src); return; }
+    snprintf(dst, dn, "/%s", src);
+}
+
 /* ------------------------------------------------------------- signon */
 
 static int cmdSignon(const char *op)
@@ -364,8 +376,8 @@ static int queryName(const char *fs, const char *hl, const char *ll)
     dsmObjName objName;
     memset(&objName, 0, sizeof(objName));
     snprintf(objName.fs, sizeof(objName.fs), "%s", fs);
-    snprintf(objName.hl, sizeof(objName.hl), "%s", hl);
-    snprintf(objName.ll, sizeof(objName.ll), "%s", ll);
+    qualCopy(objName.hl, sizeof(objName.hl), hl);
+    qualCopy(objName.ll, sizeof(objName.ll), ll);
     objName.objType = DSM_OBJ_FILE;
 
     static char anyOwner[1] = {0};
@@ -385,6 +397,9 @@ static int queryName(const char *fs, const char *hl, const char *ll)
     blk.bufferLen = sizeof(qryRespBackupData);
     blk.bufferPtr = (char *)calloc(1, sizeof(qryRespBackupData));
     if (!blk.bufferPtr) { dsmEndQuery(gHandle); return -1; }
+    /* The response buffer must carry the matching version, or the library
+     * returns ANS0245E (RC2065) "caller's structure version differs". */
+    ((qryRespBackupData *)blk.bufferPtr)->stVersion = qryRespBackupDataVersion;
     gNobj = 0;
     while ((rc = dsmGetNextQObj(gHandle, &blk)) == DSM_RC_MORE_DATA && gNobj < TAPI_MAX_VER) {
         qryRespBackupData *r = (qryRespBackupData *)blk.bufferPtr;
@@ -429,19 +444,40 @@ static int cmdSend(const char *op)
     if (nameOK(&fs, &hl, &ll)) return rsend(op, 0, -1, "bad fs/hl/ll (len or empty ll)", NULL);
     if (!gHandle) return rsend(op, 0, -1, "not signed on", NULL);
     const char *path = fStr("path", "");
-    if (!*path) return rsend(op, 0, -1, "path is required", NULL);
+    if (!*path) return rsend(op, 0, -2, "path is required", NULL);
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return rsend(op, 0, -2, "open(path) failed", NULL);
     struct stat st;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); return rsend(op, 0, -2, "not a regular file", NULL); }
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return rsend(op, 0, -2, "not a regular file", NULL);
     unsigned long long size = (unsigned long long)st.st_size;
+
+    /* The DAPI transaction path invalidates file descriptors: once
+     * dsmBeginTxn/dsmSendObj have run, read() on any open fd returns EOF
+     * (verified live). The IBM reference pattern (callret.c, dsmgrp.c)
+     * therefore stages file data in memory BEFORE the txn and feeds
+     * dsmSendData from a buffer rather than from an app-managed file.
+     * We mirror that: pre-read the whole object, then close, then txn. */
+    char *data = NULL;
+    if (size > 0) {
+        data = malloc((size_t)size);
+        if (!data) return rsend(op, 0, -2, "alloc(data) failed", NULL);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { free(data); return rsend(op, 0, -2, "open(path) failed", NULL); }
+        size_t got = 0;
+        while (got < (size_t)size) {
+            ssize_t n = read(fd, data + got, (size_t)size - got);
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n == 0) break;
+            got += (size_t)n;
+        }
+        close(fd);
+        if (got != (size_t)size) { free(data); return rsend(op, 0, -3, "short read of source file (file may have vanished)", NULL); }
+    }
 
     dsmObjName objName;
     memset(&objName, 0, sizeof(objName));
     snprintf(objName.fs, sizeof(objName.fs), "%s", fs);
-    snprintf(objName.hl, sizeof(objName.hl), "%s", hl);
-    snprintf(objName.ll, sizeof(objName.ll), "%s", ll);
+    qualCopy(objName.hl, sizeof(objName.hl), hl);
+    qualCopy(objName.ll, sizeof(objName.ll), ll);
     objName.objType = DSM_OBJ_FILE;
 
     ObjAttr attr;
@@ -451,54 +487,52 @@ static int cmdSend(const char *op)
     attr.sizeEstimate.lo = (dsUint32_t)(size & 0xFFFFFFFFuL);
 
     int rc = dsmBeginTxn(gHandle);
-    if (rc != DSM_RC_OK) { dsmMsg(rc); close(fd); return rsend(op, 0, rc, gRcMsg, NULL); }
+    if (rc != DSM_RC_OK) { dsmMsg(rc); free(data); return rsend(op, 0, rc, gRcMsg, NULL); }
+
+    /* Bind the default mgmt class. dsmSendObj without this fails with
+     * ANS0238E (DSM_RC_BAD_CALL_SEQUENCE). */
+    mcBindKey bindKey;
+    memset(&bindKey, 0, sizeof(bindKey));
+    bindKey.stVersion = mcBindKeyVersion;
+    rc = dsmBindMC(gHandle, &objName, stBackup, &bindKey);
+    if (rc != DSM_RC_OK) {
+        dsUint16_t rsn = 0;
+        dsmMsg(rc); dsmEndTxn(gHandle, DSM_VOTE_ABORT, &rsn);
+        free(data); return rsend(op, 0, rc, gRcMsg, NULL);
+    }
 
     int fail = -1;
     rc = dsmSendObj(gHandle, stBackup, NULL, &objName, &attr, NULL);
     if (rc != DSM_RC_OK) fail = rc;
 
+    /* Feed dsmSendData from the pre-read buffer in TAPI_BUF_SZ chunks. */
     unsigned long long left = size;
     while (fail == -1 && left > 0) {
         size_t want = left > TAPI_BUF_SZ ? TAPI_BUF_SZ : (size_t)left;
-        ssize_t r = 0;
-        while (r < (ssize_t)want) {
-            ssize_t n = read(fd, gBuf + (size_t)r, (size_t)(want - r));
-            if (n < 0) { if (errno == EINTR) continue; fail = -3; break; }
-            if (n == 0) { fail = -4; break; }   /* short read: file vanished */
-            r += n;
-        }
-        if (fail != -1) {
-            DataBlk blk;
-            memset(&blk, 0, sizeof(blk));
-            blk.stVersion = DataBlkVersion;
-            blk.bufferLen = (dsUint32_t)want;
-            blk.bufferPtr = gBuf;
-            rc = dsmSendData(gHandle, &blk);
-            if (rc != DSM_RC_OK) fail = rc;
-            else left -= (unsigned long long)want;
-        }
+        DataBlk blk;
+        memset(&blk, 0, sizeof(blk));
+        blk.stVersion = DataBlkVersion;
+        blk.bufferLen = (dsUint32_t)want;
+        blk.bufferPtr = data + ((unsigned long long)size - left);
+        rc = dsmSendData(gHandle, &blk);
+        if (rc != DSM_RC_OK) { dsmMsg(rc); fail = rc; }
+        else left -= (unsigned long long)want;
     }
-    close(fd);
 
     if (fail == -1) {
-        dsmEndSendObjExIn_t endIn = {0};
-        dsmEndSendObjExOut_t endOut = {0};
-        endIn.stVersion = dsmEndSendObjExInVersion;
-        endIn.dsmHandle = gHandle;
-        endOut.stVersion = dsmEndSendObjExOutVersion;
-        rc = dsmEndSendObjEx(&endIn, &endOut);
+        rc = dsmEndSendObj(gHandle);
         if (rc != DSM_RC_OK) fail = rc;
     }
+    free(data);
 
     dsUint16_t reason = 0;
     int rc2 = dsmEndTxn(gHandle, fail == -1 ? DSM_VOTE_COMMIT : DSM_VOTE_ABORT, &reason);
     if (fail != -1 || rc2 != DSM_RC_OK) {
         if (fail > 0) dsmMsg(fail);
-        else if (fail < 0) snprintf(gRcMsg, sizeof(gRcMsg), "local io error (%d)%s", fail, reason ? " ; txn aborted" : "");
         else dsmMsg(rc2);
-return rsend(op, 0, fail < 0 ? fail : (fail > 0 ? fail : rc2), gRcMsg, NULL);
+ return rsend(op, 0, fail < 0 ? fail : (fail > 0 ? fail : rc2), gRcMsg, NULL);
     }
-return rsend(op, 1, 0, NULL, NULL);
+ return rsend(op, 1, 0, NULL, NULL);
 }
 
 /* ------------------------------------------------------------- get */
@@ -559,14 +593,36 @@ return rsend(op, 0, -2, "path too long", NULL);
 
     unsigned long long got = 0;
     int fail = 0;
+    /* Reference (callmt1.c): dsmGetObj(handle, objId, &blk) with a
+     * pre-initialized DataBlk. Depending on payload size it may
+     * (a) fill blk and return DSM_RC_MORE_DATA (loop dsmGetData for more), or
+     * (b) fill blk and return DSM_RC_FINISHED (small object — write it,
+     *     call dsmEndGetObj, done). We handle both. */
     rc = dsmGetObj(gHandle, &id, &blk);
-    while (rc == DSM_RC_MORE_DATA) {
-        unsigned long long w = writeFull(fd, gBuf, (unsigned long long)blk.numBytes);
-        if (w == ~0ULL) { fail = -5; break; }
-        got += w;
-        rc = dsmGetData(gHandle, &blk);
+    if (rc == DSM_RC_OK || rc == DSM_RC_FINISHED || rc == DSM_RC_MORE_DATA) {
+        if (blk.numBytes) {
+            unsigned long long w = writeFull(fd, gBuf, (unsigned long long)blk.numBytes);
+            if (w == ~0ULL) fail = -5;
+            else got += w;
+        }
+        if (rc == DSM_RC_MORE_DATA) {
+            while (rc == DSM_RC_MORE_DATA) {
+                rc = dsmGetData(gHandle, &blk);
+                if (rc == DSM_RC_MORE_DATA && blk.numBytes) {
+                    unsigned long long w = writeFull(fd, gBuf, (unsigned long long)blk.numBytes);
+                    if (w == ~0ULL) { fail = -5; break; }
+                    got += w;
+                }
+            }
+            if (rc == DSM_RC_FINISHED) (void)dsmEndGetObj(gHandle);
+            if (!fail && rc != DSM_RC_FINISHED) fail = rc;
+        } else {
+            /* FINISHED from dsmGetObj directly */
+            (void)dsmEndGetObj(gHandle);
+        }
+    } else {
+        fail = rc;   /* dsmGetObj error */
     }
-    if (!fail && rc != DSM_RC_FINISHED) fail = rc;
     (void)dsmEndGetData(gHandle);
     close(fd);
 

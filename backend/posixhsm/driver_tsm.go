@@ -118,11 +118,18 @@ type TsmOpts struct {
 	Filespace string
 
 	// ClientDir is the TSM client configuration directory holding dsm.sys,
-	// dsm.opt and dsmkey (see the driver doc block above). Defaults to
-	// /opt/tivoli/tsm/client/api/bin64.
+	// dsm.opt and (optionally) dsmkey / NLS catalogs. The helper opens this
+	// directory as `dsmiDir` and `dsmiLog`, so the daemon user must own
+	// write permission here. Defaults to /opt/tivoli/tsm/client/ba/bin (the
+	// standard dsmc client dir, NOT the DAPI-SDK lib dir under client/api/,
+	// which never holds dsm.sys/dsm.opt).
 	ClientDir string
 
-	// DsmOpt overrides the options file to pass to dsmSetUp. Optional.
+	// DsmOpt is the options file to pass to dsmSetUp (as dsmiConfig). The
+	// dsmSetUp(3) call does NOT auto-discover dsm.opt from dsmiDir; without
+	// this (or an explicit --tsm-options), signon fails with
+	// DSM_RC_NO_OPT_FILE (406). Auto-derived to <ClientDir>/dsm.opt when
+	// empty.
 	DsmOpt string
 
 	// Options is the inline option string to pass to dsmInitEx. Optional.
@@ -144,10 +151,13 @@ func (o *TsmOpts) withDefaults() {
 		o.Timeout = 30 * time.Minute
 	}
 	if o.ClientDir == "" {
-		o.ClientDir = "/opt/tivoli/tsm/client/api/bin64"
+		o.ClientDir = "/opt/tivoli/tsm/client/ba/bin"
 	}
 	if o.Owner == "" {
 		o.Owner = o.Node
+	}
+	if o.DsmOpt == "" {
+		o.DsmOpt = filepath.Join(o.ClientDir, "dsm.opt")
 	}
 }
 

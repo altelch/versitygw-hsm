@@ -463,11 +463,30 @@ func TestTsmDriver_BatchIncludesSignonAndQuit(t *testing.T) {
 func TestTsmDriver_OptDefaults(t *testing.T) {
 	o := TsmOpts{}
 	o.withDefaults()
-	if o.ClientDir != "/opt/tivoli/tsm/client/api/bin64" {
+	if o.ClientDir != "/opt/tivoli/tsm/client/ba/bin" {
 		t.Errorf("ClientDir default = %q", o.ClientDir)
+	}
+	if o.DsmOpt != "/opt/tivoli/tsm/client/ba/bin/dsm.opt" {
+		t.Errorf("DsmOpt default = %q; want <ClientDir>/dsm.opt", o.DsmOpt)
 	}
 	if o.Timeout != 30*time.Minute {
 		t.Errorf("Timeout default = %v; want 30m", o.Timeout)
+	}
+}
+
+func TestTsmDriver_OptDefaults_DsmOptDerivedFromClientDir(t *testing.T) {
+	o := TsmOpts{ClientDir: "/srv/tsm"}
+	o.withDefaults()
+	if o.DsmOpt != "/srv/tsm/dsm.opt" {
+		t.Errorf("DsmOpt = %q; want /srv/tsm/dsm.opt", o.DsmOpt)
+	}
+}
+
+func TestTsmDriver_OptDefaults_DsmOptExplicitWins(t *testing.T) {
+	o := TsmOpts{ClientDir: "/srv/tsm", DsmOpt: "/elsewhere/dsm.opt"}
+	o.withDefaults()
+	if o.DsmOpt != "/elsewhere/dsm.opt" {
+		t.Errorf("DsmOpt = %q; want /elsewhere/dsm.opt (explicit must win)", o.DsmOpt)
 	}
 }
 

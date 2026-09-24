@@ -76,3 +76,4 @@ metrics-exploration/grafana_data/**
 # bats tools
 /tests/bats-assert
 /tests/bats-support
+hsmtools/tsmapi/tsmapi

@@ -292,7 +292,7 @@ func main() {
 		&cli.StringFlag{Name: "tsm-owner", Usage: "TSM owner name; defaults to --tsm-node", EnvVars: []string{"VGWTAPED_TSM_OWNER"}, Destination: &tsmOwner},
 		&cli.StringFlag{Name: "tsm-filespace", Usage: "TSM filespace scope for hl/ll; defaults to --rootdir", EnvVars: []string{"VGWTAPED_TSM_FILESPACE"}, Destination: &tsmFilespace},
 		&cli.StringFlag{Name: "tsm-helper", Usage: "path to the tsmapi C helper (build: hsmtools/tsmapi); default: tsmapi on $PATH", EnvVars: []string{"VGWTAPED_TSM_HELPER", "TSM_HELPER"}, Destination: &tsmHelper},
-		&cli.StringFlag{Name: "tsm-clientdir", Usage: "TSM client config dir holding dsm.sys/dsm.opt/dsmkey; default: /opt/tivoli/tsm/client/api/bin64", EnvVars: []string{"VGWTAPED_TSM_CLIENTDIR"}, Destination: &tsmClientDir},
+		&cli.StringFlag{Name: "tsm-clientdir", Usage: "TSM client config dir holding dsm.sys/dsm.opt/dsmkey (must be writable by the daemon user, and may hold NLS catalogs); default: /opt/tivoli/tsm/client/ba/bin", EnvVars: []string{"VGWTAPED_TSM_CLIENTDIR"}, Destination: &tsmClientDir},
 		&cli.StringFlag{Name: "tsm-options", Usage: "inline dsmInitEx option string (e.g. mgmt-class override), optional", EnvVars: []string{"VGWTAPED_TSM_OPTIONS"}, Destination: &tsmOptions},
 		&cli.StringFlag{Name: "zfs-dataset", Usage: "ZFS dataset name to tier (enables incremental scan via zfs diff; mount point must equal --rootdir)", EnvVars: []string{"VGWTAPED_ZFS_DATASET"}, Destination: &zfsDataset},
 		&cli.IntFlag{Name: "workers", Value: 4, Usage: "number of concurrent restore workers", EnvVars: []string{"VGWTAPED_WORKERS"}, Destination: &workers},
