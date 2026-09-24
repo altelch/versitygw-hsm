@@ -2253,7 +2253,7 @@ func putBucketVersioningStatus(client *s3.Client, bucket string, status types.Bu
 	return err
 }
 
-func checkWORMProtection(client *s3.Client, bucket, object string) error {
+func checkWORMProtection(s *S3Conf, client *s3.Client, bucket, object string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 	_, err := client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &bucket,
@@ -2262,6 +2262,19 @@ func checkWORMProtection(client *s3.Client, bucket, object string) error {
 	cancel()
 	if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
 		return err
+	}
+
+	resp, err := sendPostObject(PostRequestConfig{
+		bucket:      bucket,
+		key:         object,
+		s3Conf:      s,
+		fileContent: []byte("overwrite"),
+	})
+	if err != nil {
+		return err
+	}
+	if err := checkHTTPResponseApiErr(resp, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
+		return fmt.Errorf("POST object overwrite: %w", err)
 	}
 
 	ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
@@ -3936,6 +3949,36 @@ func sendPostObject(input PostRequestConfig) (*http.Response, error) {
 	}
 
 	return input.s3Conf.httpClient.Do(req)
+}
+
+// sendAnonymousPostObject sends an unauthenticated POST object request to
+// /{bucket}: the form carries key and the file, but none of the five
+// form-based auth fields.
+func sendAnonymousPostObject(s *S3Conf, bucket, key string, fileContent []byte) (*http.Response, error) {
+	return sendPostObject(PostRequestConfig{
+		bucket:      bucket,
+		key:         key,
+		s3Conf:      s,
+		fileContent: fileContent,
+		extraFields: map[string]string{
+			"x-amz-algorithm":  "",
+			"x-amz-credential": "",
+			"x-amz-date":       "",
+			"policy":           "",
+			"x-amz-signature":  "",
+		},
+	})
+}
+
+// checkPostObjectSuccess checks that resp is the 204 No Content a POST
+// object upload returns by default, reporting the response body otherwise.
+func checkPostObjectSuccess(resp *http.Response) error {
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("expected status 204, instead got %d: %s", resp.StatusCode, body)
+	}
+	return nil
 }
 
 func newPostObjectRequest(input PostRequestConfig) (*http.Request, map[string]string, error) {
