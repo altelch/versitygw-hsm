@@ -67,10 +67,13 @@ import (
 //   - A FileSet whose Include contains `File = "<opts.FileListPath"`,
 //     i.e. it reads the per-pass due-file list the driver writes (one
 //     absolute path per line) instead of pinning a static directory.
-//   - A Backup Job (e.g. "HsmBackup") at `Level = File` using the above,
+//   - A Backup Job (e.g. "HsmBackup") at `Level = Full` using the above,
 //     with the intended Storage/Pool and with NO Schedule or other
 //     trigger (see PROJECT.MD §7 "Job content").  This is what
 //     ArchiveWave runs; its content is exactly the due set.
+//     NOTE: `Full` is the correct *job* level here. (There is no
+//     Director job level called `File` — `File` is a file-daemon *scan*
+//     concept. `Level = File` makes bareos-dir refuse to start.)
 //   - A Restore Job (e.g. "HsmRestore") of Type = Restore whose Where
 //     equals the posix rootdir (default for `where` in the restore
 //     command) -- the bareos-fd must restore the file back to its
@@ -80,9 +83,9 @@ import (
 // directory. After tiering truncates an object to 0 bytes, a
 // changed-since-Incremental run would re-save the 0-byte stub, and a
 // restore would then hand back empty data. The list makes the job content
-// exactly the online, due objects and nothing else. Level=File forces the
-// fd to save each listed file as a full version regardless of mtime/size,
-// so an unchanged-but-listed file is never skipped (the locator pinning a
+// exactly the online, due objects and nothing else. Level = Full saves
+// every file named by the list-constrained FileSet as a full version, so
+// an unchanged-but-listed file is never skipped (a locator pinning a
 // jobid that omits it would be unrecoverable).
 //
 // Bareos has no per-file delete from a written volume; Purge below is
@@ -113,7 +116,7 @@ type BareosOpts struct {
 
 	// BackupJob is the name of a Type=Backup Job that will archive the
 	// tiered objects. Its FileSet must consume the per-pass due-file list
-	// via `File = "<FileListPath"` and run at `Level = File`, so the job
+	// via `File = "<FileListPath"` and run at `Level = Full`, so the job
 	// archive contains exactly the objects the daemon decided to tier.
 	// Required.
 	BackupJob string
@@ -497,7 +500,7 @@ func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]
 	}
 
 	// The job's FileSet reads the per-pass list at FileListPath (`File =
-	// "< file"`) and Level=File saves exactly these files, so a truncate
+	// "< file"`) and Level=Full saves exactly these files, so a truncate
 	// from an earlier pass can never make it into the archive and no
 	// not-yet-due object rides along. Atomic write (temp + rename) so the
 	// fd can never observe a half-written list.
