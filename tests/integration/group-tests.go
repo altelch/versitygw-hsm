@@ -26,6 +26,7 @@ func TestAuthentication(ts *TestState) {
 	ts.Run(Authentication_credentials_invalid_terminal)
 	ts.Run(Authentication_credentials_incorrect_service)
 	ts.Run(Authentication_credentials_incorrect_region)
+	ts.Run(Authentication_credentials_incorrect_region_head)
 	ts.Run(Authentication_credentials_invalid_date)
 	ts.Run(Authentication_credentials_future_date)
 	ts.Run(Authentication_credentials_past_date)
@@ -2017,6 +2018,7 @@ func TestVersioning(ts *TestState) {
 	ts.Run(Versioning_DeleteObject_delete_object_version)
 	ts.Run(Versioning_DeleteObject_dir_object_latest_version)
 	ts.Run(Versioning_DeleteObject_latest_version_with_null_version)
+	ts.Run(Versioning_DeleteObject_latest_version_null_version_order)
 	ts.Run(Versioning_DeleteObject_non_existing_object)
 	ts.Run(Versioning_DeleteObject_implicit_dir)
 	ts.Run(Versioning_DeleteObject_trailing_slash_counterpart)
@@ -2041,6 +2043,7 @@ func TestVersioning(ts *TestState) {
 	ts.Run(ListObjectVersions_multiple_object_versions_truncated)
 	ts.Run(ListObjectVersions_with_delete_markers)
 	ts.Run(ListObjectVersions_containing_null_versionId_obj)
+	ts.Run(ListObjectVersions_paginate_null_version)
 	ts.Run(ListObjectVersions_single_null_versionId_object)
 	ts.Run(ListObjectVersions_checksum)
 	// Multipart upload
@@ -2313,6 +2316,7 @@ func GetIntTests() IntTests {
 		"Authentication_credentials_invalid_terminal":                                      Authentication_credentials_invalid_terminal,
 		"Authentication_credentials_incorrect_service":                                     Authentication_credentials_incorrect_service,
 		"Authentication_credentials_incorrect_region":                                      Authentication_credentials_incorrect_region,
+		"Authentication_credentials_incorrect_region_head":                                 Authentication_credentials_incorrect_region_head,
 		"Authentication_credentials_invalid_date":                                          Authentication_credentials_invalid_date,
 		"Authentication_credentials_future_date":                                           Authentication_credentials_future_date,
 		"Authentication_credentials_past_date":                                             Authentication_credentials_past_date,
@@ -3574,6 +3578,7 @@ func GetIntTests() IntTests {
 		"Versioning_DeleteObject_invalid_versionId":                                        Versioning_DeleteObject_invalid_versionId,
 		"Versioning_DeleteObject_delete_object_version":                                    Versioning_DeleteObject_delete_object_version,
 		"Versioning_DeleteObject_latest_version_with_null_version":                         Versioning_DeleteObject_latest_version_with_null_version,
+		"Versioning_DeleteObject_latest_version_null_version_order":                        Versioning_DeleteObject_latest_version_null_version_order,
 		"Versioning_DeleteObject_dir_object_latest_version":                                Versioning_DeleteObject_dir_object_latest_version,
 		"Versioning_DeleteObject_non_existing_object":                                      Versioning_DeleteObject_non_existing_object,
 		"Versioning_DeleteObject_implicit_dir":                                             Versioning_DeleteObject_implicit_dir,
@@ -3596,6 +3601,7 @@ func GetIntTests() IntTests {
 		"ListObjectVersions_multiple_object_versions_truncated":                            ListObjectVersions_multiple_object_versions_truncated,
 		"ListObjectVersions_with_delete_markers":                                           ListObjectVersions_with_delete_markers,
 		"ListObjectVersions_containing_null_versionId_obj":                                 ListObjectVersions_containing_null_versionId_obj,
+		"ListObjectVersions_paginate_null_version":                                         ListObjectVersions_paginate_null_version,
 		"ListObjectVersions_single_null_versionId_object":                                  ListObjectVersions_single_null_versionId_object,
 		"ListObjectVersions_checksum":                                                      ListObjectVersions_checksum,
 		"Versioning_Multipart_Upload_success":                                              Versioning_Multipart_Upload_success,
