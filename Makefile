@@ -165,6 +165,15 @@ cuobjtest-host-docker: cuobjtest-host-builder-image
 testbin:
 	$(GOBUILD) $(LDFLAGS) -o $(BIN) -cover -race cmd/$(BIN)/*.go
 
+.PHONY: tsmapi
+tsmapi:
+	$(MAKE) -C hsmtools/tsmapi
+
+.PHONY: tsmapi-test
+tsmapi-test: tsmapi
+	$(MAKE) -C hsmtools/tsmapi test
+
+
 .PHONY: test
 test:
 	$(GOTEST) ./...
