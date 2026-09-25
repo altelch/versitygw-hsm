@@ -973,7 +973,11 @@ return rsend(op, 1, 0, NULL, extra);
 
 
 /* =============================================================== CLI =====
- * One-shot operator modes, separate from the NDJSON protocol:
+ * One-shot operator modes, separate from the NDJSON protocol. All three
+ * sign on to the server with -n/-c/-o (node + client config dir + extra
+ * options) and work against the classic dsmc layout, so they can restore
+ * data that was tiered with vgwtaped --driver tsm, with a plain dsmc
+ * backup, or by hand.
  *
  *   tsmapi ls     -n NODE [-c CLIENTDIR] [-o DSMOPT] [-M]
  *       list the active backup objects of the node, one JSON object per
@@ -984,19 +988,32 @@ return rsend(op, 1, 0, NULL, extra);
  *       by default; -M shows them. "latest" marks the newest copy of each
  *       name. hl/ll are shown without the leading '/' qualifier.
  *
+ *   tsmapi meta HL LL
+ *       print the deterministic companion object name for (HL, LL) and
+ *       exit. No server contact. Parity/debug helper so shell scripts can
+ *       verify the name the Go driver computes (posixhsm MetaName) before
+ *       querying the catalog.
+ *
  *   tsmapi restore -n NODE [-c CLIENTDIR] [-o DSMOPT] -d DEST
  *                  [-m xattr|sidecar|raw|none] [--sidecar DIR] <ERE>...
- *       restore every active backup object whose "hl/ll" path matches any of
- *       the POSIX EREs (search semantics, case-sensitive), plus its metadata
- *       companion if one exists. The destination layout is
- *       DEST/<hl>/<ll>. Companion replay follows -m:
- *         xattr    (default): setxattr("user.<attr>") onto DEST/<hl>/<ll>
- *         sidecar : one file per attribute at DIR/<hl>/<ll>/meta/<attr>
- *         raw     : the companion JSON payload at DEST/<hl>/<ll>.hsm-meta
- *         none    : data only
  *
- * Shared: -c defaults to /opt/tivoli/tsm/client/ba/bin (matching the Go
- * driver), -o is an extra dsm.opt path/option string.
+ *   See the "restore" section further below for the full specification.
+ *
+ * Shared arguments for every server-contacting mode:
+ *   -n NODE       TSM client node name (required for ls/restore). Must be a
+ *                 registered node; the keyring pair must exist under CLIENTDIR.
+ *   -c CLIENTDIR  client config directory holding dsm.sys / dsm.opt /
+ *                 NLS catalogs (default /opt/tivoli/tsm/client/ba/bin,
+ *                 matching the Go driver's flag default). Must be writable
+ *                 (tsmapi.log + the DAPI write its own state here).
+ *   -o DSMOPT     extra dsm.opt path or inline option string (e.g. an
+ *                 mgmt-class override). Empty by default.
+ *   -h / --help   print usage and exit 0.
+ *
+ * stdout/stderr split (all CLI modes): stdout is reserved for data
+ * (ls: JSON lines; restore: nothing), so it can be piped. All progress,
+ * per-object lines, errors and the summary go to stderr. tsmapi.log
+ * (DAPI diagnostics) lands in CLIENTDIR.
  */
 
 static int cliDsmSignon(const char *node, const char *clientdir,
@@ -1213,6 +1230,106 @@ static int cmdCliLs(int showMeta)
     cliFreeEnum(list);
     return 0;
 }
+
+/* =============================================================== RESTORE ====
+ *
+ *   tsmapi restore  [ -n NODE ] [ -c CLIENTDIR ] [ -o DSMOPT ]
+ *                   -d DEST
+ *                   [ -m xattr|sidecar|raw|none ]
+ *                   [ --sidecar DIR ]
+ *                   PATTERN [ PATTERN ... ]
+ *
+ * Restore one or more tiered objects (and their S3 metadata) from the TSM
+ * server back onto local disk, outside the daemon. This is the operator
+ * escape hatch the "Glacier" flow relies on when an object has been tiered
+ * away and its live copy has been truncated: the data is still on tape, and
+ * this command re-materializes it at a chosen destination.
+ *
+ * ARGUMENTS
+ *   -d DEST            REQUIRED. Root directory restored files are placed
+ *                      under. Layout is fixed: DEST/<hl>/<ll> (hl is the
+ *                      high-level/directory part, ll the low-level/leaf).
+ *                      DEST need not exist — parent dirs are created on
+ *                      demand. A DEST/<hl>/<ll> that already exists as a
+ *                      regular file is skipped (not overwritten), so a
+ *                      re-run is idempotent for data.
+ *   -m MODE            Data is restored in ALL modes (to DEST, see -d);
+ *                      this flag only controls where the metadata
+ *                      companion is replayed (or dropped), if a
+ *                      companion was archived for the object:
+ *                        xattr    (default) — one setxattr("user.<attr>")
+ *                                         per attribute, set on the
+ *                                         restored file DEST/<hl>/<ll>.
+ *                                         Linux only.
+ *                        sidecar  — one file per attribute at
+ *                                   DIR/<hl>/<ll>/meta/<attr>, matching
+ *                                   meta.SideCar; --sidecar DIR is
+ *                                   REQUIRED. (Use this to target an
+ *                                   existing --sidecar gateway.)
+ *                        raw      — the whole companion JSON payload written
+ *                                   verbatim to DEST/<hl>/<ll>.hsm-meta.
+ *                        none     — data only; metadata is ignored.
+ *   --sidecar DIR      Sidecar root for -m sidecar. Layout
+ *                      DIR/<hl>/<ll>/meta/<attr>. Required when -m sidecar.
+ *   PATTERN ...        One or more POSIX ERE (REG_EXTENDED, case-sensitive)
+ *                      matched against each object's "hl/ll" path. An object
+ *                      is restored if ANY pattern matches (search, not
+ *                      exact, semantics). Quoting matters: the shell must not
+ *                      glob-expand the ERE — quote it.
+ *
+ * SELECTION / MATCHING
+ *   tsmapi enumerates the node's ACTIVE backup objects (hl wildcard all,
+ *   ll slash-star, all files, state=active), then keeps the ones whose
+ *   "hl/ll" path regexec-matches any PATTERN. Metadata companions are never
+ *   data: any ll ending in ".hsm-meta" is excluded from the data set; it is
+ *   fetched separately for replay. Only the NEWEST active version of each
+ *   name is restored (fetchLatest), matching the daemon contract.
+ *
+ * WHAT IS WRITTEN, PER MATCHED OBJECT
+ *   1. Data: fetched to DEST/<hl>/<ll> (created, then the newest version is
+ *      streamed in). If the destination file already exists, it is left as
+ *      is (counted restored, not re-fetched).
+ *   2. Metadata (only if a companion named MetaName(hl,ll) is on the
+ *      server AND -m != none): fetched and replayed per -m (xattr /
+ *      sidecar / raw) as described above. If no companion exists, data
+ *      still restores — metadata replay is a no-op, not an error.
+ *   Companion payload shape (what step 2 consumes) — the same JSON the
+ *   daemon's state.CaptureMeta produced:
+ *     {"src":"<live path>",
+ *      "attrs":{"<attr>":"<base64>", ...}}
+ *   Replay decodes each base64 value and writes it by mode; the "src" field
+ *   is informational and not used by any mode.
+ *
+ * EXIT STATUS
+ *   0  all matched objects' data restored (metadata may be absent / none)
+ *   1  at least one object's data could not be restored
+ *   2  bad invocation (missing -n/-d, bad -m, invalid ERE, --sidecar missing
+ *      for -m sidecar, >32 patterns)
+ *
+ * EXAMPLES
+ *   # restore one object with default (xattr) metadata, into a new tree:
+ *   tsmapi restore -n MYNODE -d /restore 'reports/2026/.*\.pdf'
+ *
+ *   # restore a bucket's files into an existing sidecar gateway's dir, so
+ *   # the gateway (run with --sidecar /meta) sees metadata again:
+ *   tsmapi restore -n MYNODE -d /data --sidecar /meta -m sidecar '^docs/'
+ *
+ *   # data only, no metadata:
+ *   tsmapi restore -n MYNODE -d /restore -m none '^cache/'
+ *
+ *   # two patterns (OR), inspect the catalog first:
+ *   tsmapi ls -n MYNODE -M                        # JSON listing on stdout
+ *   tsmapi restore -n MYNODE -d /restore 'bin/.*' 'lib/.*'
+ *
+ * NOTES
+ *   - "hl/ll" here is the TSM name of the object, not necessarily a local
+ *     filesystem path. To know what hl/ll your tiered objects have, use
+ *   `tsmapi ls -n NODE` (or `tsmapi meta HL LL` for one name) so your
+ *   PATTERN matches the server-side name, not the original absolute path.
+ *   - -d DEST is where you WANT the bytes, which may differ from the
+ *     original location; -m sidecar's DIR, by contrast, must equal the
+ *     directory the gateway/daemon actually reads metadata from.
+ */
 
 /* --- restore ------------------------------------------------------------------ */
 
