@@ -114,6 +114,21 @@ func (d *Daemon) forget(bucket, path string) {
 	}
 }
 
+// captureMeta snapshots the object's S3 metadata (via the shared
+// MetadataStorer, so both xattr and sidecar layouts are captured) into the
+// payload a driver archives as a companion object. It addresses the object
+// the same way the rest of the daemon does: absolute path, empty object.
+// Errors are non-fatal: the tier still proceeds with data only, and the
+// object's pre-existing metadata stays in place for the daemon-driven
+// restore path.
+func (d *Daemon) captureMeta(path string) []byte {
+	m, err := state.CaptureMeta(d.meta, path, "")
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
 // fsLister walks a real posix tree rooted at rootdir.
 type fsLister struct {
 	rootdir string
@@ -258,8 +273,8 @@ func (d *Daemon) Tier(ctx context.Context) (int, error) {
 			}
 			// enqueue a tier job for bookkeeping/dedup
 			_, _ = d.q.Enqueue(queue.Job{Op: queue.JobOpTier, Bucket: bucket, Key: c.Key})
-			due = append(due, posixhsm.WaveFile{Path: c.Path, Size: c.Size})
-			dueKeyed = append(dueKeyed, keyedFile{wf: posixhsm.WaveFile{Path: c.Path, Size: c.Size}, bucket: bucket})
+			due = append(due, posixhsm.WaveFile{Bucket: bucket, Key: c.Key, Path: c.Path, Size: c.Size, Meta: d.captureMeta(c.Path)})
+			dueKeyed = append(dueKeyed, keyedFile{wf: posixhsm.WaveFile{Bucket: bucket, Key: c.Key, Path: c.Path, Size: c.Size}, bucket: bucket})
 		}
 	}
 	if len(due) == 0 {
@@ -351,6 +366,21 @@ func (d *Daemon) RestoreJobs(ctx context.Context, max int) (int, error) {
 			_ = d.q.Fail(job, rerr.Error())
 			continue
 		}
+		// Replay the archived S3 metadata companion (if the driver
+		// supports it). Runs BEFORE ClearOffline so a replay failure
+		// leaves the object offline and retriable; an empty payload is
+		// a no-op (no companion was archived).
+		if mp, ok := d.drv.(posixhsm.MetaPayload); ok {
+			if payload, ferr := mp.FetchMeta(ctx, st.Locator); ferr != nil {
+				_ = d.q.Fail(job, ferr.Error())
+				continue
+			} else if len(payload) > 0 {
+				if rerr2 := state.RestoreMeta(d.meta, path, "", payload); rerr2 != nil {
+					_ = d.q.Fail(job, rerr2.Error())
+					continue
+				}
+			}
+		}
 		if cerr := state.ClearOffline(d.meta, path); cerr != nil {
 			_ = d.q.Fail(job, cerr.Error())
 			continue
@@ -394,7 +424,10 @@ func (d *Daemon) Sweep(ctx context.Context) (int, error) {
 			if d.now().After(exp) {
 				_ = state.Set(d.meta, c.Path, state.Expiry, "")
 				_, _ = d.q.Enqueue(queue.Job{Op: queue.JobOpTier, Bucket: bucket, Key: c.Key})
-				expired = append(expired, posixhsm.WaveFile{Path: c.Path, Size: c.Size})
+				// Re-tiering: archive the current data AND the current
+				// S3 metadata (the object may have been re-uploaded with
+				// different metadata while online).
+				expired = append(expired, posixhsm.WaveFile{Bucket: bucket, Key: c.Key, Path: c.Path, Size: c.Size, Meta: d.captureMeta(c.Path)})
 			}
 		}
 	}

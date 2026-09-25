@@ -513,7 +513,7 @@ func TestTsmDriver_TsmBatch_Malformed(t *testing.T) {
 	d.run = func(ctx context.Context, path string, lines []string) ([]byte, error) {
 		return []byte("this is not json\n"), nil
 	}
-	if _, err := d.tsmBatch(context.Background(), []string{`{"op":"ping"}`}); err == nil {
+	if _, _, err := d.tsmBatch(context.Background(), []string{`{"op":"ping"}`}); err == nil {
 		t.Errorf("tsmBatch: expected error on malformed response")
 	}
 }
@@ -523,7 +523,166 @@ func TestTsmDriver_TsmBatch_HelperError(t *testing.T) {
 	d.run = func(ctx context.Context, path string, lines []string) ([]byte, error) {
 		return nil, fmt.Errorf("helper exploded")
 	}
-	if _, err := d.tsmBatch(context.Background(), []string{`{"op":"ping"}`}); err == nil {
+	if _, _, err := d.tsmBatch(context.Background(), []string{`{"op":"ping"}`}); err == nil {
 		t.Errorf("tsmBatch: expected error when helper process fails")
+	}
+}
+
+// --- metadata companion tests -------------------------------------------------
+
+func TestTsmDriver_ArchiveWave_MetaCompanion(t *testing.T) {
+	rootdir := t.TempDir()
+	f := filepath.Join(rootdir, "bkt", "key")
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tsmSeedFile(t, f, 64)
+	const payload = `{"attrs":{"x-a":"AQ=="}}`
+	d, fake := newTsmFakeDriverInRoot(t, rootdir,
+		&tsmBatch{result: okResp("send")}, nil, nil)
+	d.opts.TmpDir = t.TempDir()
+
+	locs, err := d.ArchiveWave(context.Background(), []WaveFile{{
+		Path: f, Size: 64, Meta: []byte(payload),
+	}})
+	if err != nil {
+		t.Fatalf("ArchiveWave: %v", err)
+	}
+	if len(locs) != 1 {
+		t.Fatalf("want 1 locator, got %v", locs)
+	}
+
+	// The batch must carry the data send AND a companion send with the
+	// deterministic MetaName as ll.
+	lines := fake.gotBatch[0]
+	sends := 0
+	var metaSendLine string
+	for _, l := range lines {
+		if strings.Contains(l, `"op":"send"`) {
+			sends++
+			if strings.Contains(l, MetaName("bkt", "key")) {
+				metaSendLine = l
+			}
+		}
+	}
+	if sends != 2 {
+		t.Fatalf("expected 2 sends (data + meta companion), got %d in %v", sends, lines)
+	}
+	if metaSendLine == "" {
+		t.Fatalf("no companion send line with MetaName %q found in %v", MetaName("bkt", "key"), lines)
+	}
+	// The companion payload must have been staged to a real file the
+	// helper could read, and it is removed after the wave.
+	if len(d.metaStaging) != 0 {
+		t.Fatalf("staging should be cleared, left %v", d.metaStaging)
+	}
+}
+
+func TestTsmDriver_ArchiveWave_MetaStagingCleanedOnFail(t *testing.T) {
+	rootdir := t.TempDir()
+	f := filepath.Join(rootdir, "o.dat")
+	tsmSeedFile(t, f, 8)
+	d, _ := newTsmFakeDriverInRoot(t, rootdir,
+		&tsmBatch{result: errResp("send", 1, "boom")}, nil, nil)
+	d.opts.TmpDir = t.TempDir()
+	entryBefore := dirEntryCount(t, d.opts.TmpDir)
+
+	_, err := d.ArchiveWave(context.Background(), []WaveFile{{
+		Path: f, Size: 8, Meta: []byte(`{"attrs":{}}`),
+	}})
+	if err == nil {
+		t.Fatal("ArchiveWave should fail on a failed send")
+	}
+	if got := dirEntryCount(t, d.opts.TmpDir); got != entryBefore {
+		t.Fatalf("staging dir grew from %d to %d entries on failure", entryBefore, got)
+	}
+}
+
+func dirEntryCount(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", dir, err)
+	}
+	return len(entries)
+}
+
+func TestTsmDriver_Purge_DeletesCompanion(t *testing.T) {
+	rootdir := t.TempDir()
+	d, fake := newTsmFakeDriverInRoot(t, rootdir, nil, nil,
+		&tsmBatch{result: []byte(`{"ok":true,"op":"delete","deleted":1}` + "\n")})
+
+	loc := tsmLocator(rootdir, "bkt", "obj")
+	if err := d.Purge(context.Background(), loc); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	lines := fake.gotBatch[0]
+	// signon, delete(data), delete(companion), quit
+	deletes := 0
+	foundMetaDelete := false
+	for _, l := range lines {
+		if strings.Contains(l, `"op":"delete"`) {
+			deletes++
+			if strings.Contains(l, MetaName("bkt", "obj")) {
+				foundMetaDelete = true
+			}
+		}
+	}
+	if deletes != 2 {
+		t.Fatalf("expected 2 deletes (data + companion), got %d in %v", deletes, lines)
+	}
+	if !foundMetaDelete {
+		t.Fatalf("companion delete missing from %v", lines)
+	}
+}
+
+func TestTsmDriver_FetchMeta(t *testing.T) {
+	rootdir := t.TempDir()
+	const payload = `{"attrs":{"x-m":"YQ=="}}`
+	d, _ := newTsmFakeDriverInRoot(t, rootdir, nil, nil, nil)
+	d.opts.TmpDir = t.TempDir()
+
+	// The fake helper mirrors the real one: a `get` for the companion
+	// writes the payload to <path>.tsmpartial.
+	plantGet := func(found string) {
+		d.run = func(ctx context.Context, path string, lines []string) ([]byte, error) {
+			var target string
+			for _, l := range lines {
+				if strings.Contains(l, `"op":"get"`) && strings.Contains(l, MetaName("bkt", "obj")) {
+					j := strings.Index(l, `"path":"`)
+					if j >= 0 {
+						j += len(`"path":"`)
+						if e := strings.Index(l[j:], `"`); e >= 0 {
+							target = l[j : j+e]
+						}
+					}
+				}
+			}
+			if target != "" {
+				if err := os.WriteFile(target+".tsmpartial", []byte(payload), 0o644); err != nil {
+					t.Fatalf("plant .tsmpartial: %v", err)
+				}
+			}
+			return []byte(`{"ok":true,"op":"get","found":` + found + `}` + "\n"), nil
+		}
+	}
+
+	plantGet("true")
+	b, err := d.FetchMeta(context.Background(), tsmLocator(rootdir, "bkt", "obj"))
+	if err != nil {
+		t.Fatalf("FetchMeta: %v", err)
+	}
+	if string(b) != payload {
+		t.Fatalf("FetchMeta = %q, want %q", b, payload)
+	}
+
+	// A store without a companion yields an empty payload, no error.
+	plantGet("false")
+	b2, err := d.FetchMeta(context.Background(), tsmLocator(rootdir, "bkt", "obj"))
+	if err != nil {
+		t.Fatalf("FetchMeta(missing companion) should not error: %v", err)
+	}
+	if len(b2) != 0 {
+		t.Fatalf("FetchMeta(missing) = %q, want empty", b2)
 	}
 }

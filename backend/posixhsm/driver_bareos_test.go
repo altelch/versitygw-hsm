@@ -23,6 +23,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/versity/versitygw/backend/meta"
+	"github.com/versity/versitygw/backend/posixhsm/state"
 )
 
 // bareosBatch is the recorded console-command list of one bconsole invocation,
@@ -44,6 +47,10 @@ type fakeExec struct {
 	// moment a run-job batch is observed — lets tests inspect driver state
 	// (e.g. the due-file list) at exactly the point bconsole would run.
 	onRunJob func(cmds []string)
+	// onRestore, when set, is called with the restore command (the single
+	// "restore client=..." line) at the moment a restore batch is observed
+	// — lets tests emulate the fd writing the restored file in place.
+	onRestore func(restoreCmd string)
 }
 
 func (f *fakeExec) run(ctx context.Context, path, config, director string, cmds []string) ([]byte, error) {
@@ -63,6 +70,9 @@ func (f *fakeExec) run(ctx context.Context, path, config, director string, cmds 
 			}
 			return b.result, b.err
 		case strings.HasPrefix(c, "restore client="):
+			if f.onRestore != nil {
+				f.onRestore(c)
+			}
 			b := f.restore
 			if b == nil {
 				return nil, fmt.Errorf("fake: no restore batch configured")
@@ -475,5 +485,281 @@ func TestBareosDriver_ArchiveWaveRefusesWithoutFileList(t *testing.T) {
 	}
 	if len(f.got) != 0 {
 		t.Fatalf("no job may run without a file list path, got %q", f.got)
+	}
+}
+
+// --- sidecar metadata companion (CompanionMeta) ----------------------------
+
+func newCompanionDriver(t *testing.T, filelist, metaDir string, archive, restore *bareosBatch) (*BareosHsmDriver, *fakeExec) {
+	t.Helper()
+	if filelist == "" {
+		filelist = filepath.Join(t.TempDir(), "hsm-bareos-filelist.txt")
+	}
+	f := &fakeExec{archive: archive, restore: restore}
+	d := newBareosDriverWithExec(BareosOpts{
+		Client:        "client1",
+		BackupJob:     "BackupTest",
+		RestoreJob:    "RestoreTest",
+		FileListPath:  filelist,
+		Timeout:       5 * time.Second,
+		CompanionMeta: true,
+		MetaStageDir:  metaDir,
+	}, f.run)
+	return d, f
+}
+
+func TestCompanionNameForDeterministic(t *testing.T) {
+	a := companionNameFor("/data/bkt/key.bin")
+	b := companionNameFor("/data/bkt/key.bin")
+	c := companionNameFor("/data/bkt2/key.bin")
+	if a != b {
+		t.Fatalf("same path must yield the same companion name: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Fatalf("different dirs with same leaf must NOT collide: %q", a)
+	}
+	if !strings.HasSuffix(a, MetaSuffix) {
+		t.Fatalf("companion name %q must end with %s", a, MetaSuffix)
+	}
+}
+
+// A file with a Meta snapshot, when CompanionMeta is on, must be staged to
+// a companion file OUTSIDE the rootdir AND appended to the due-list, so the
+// same backup job archives it.
+func TestBareosDriver_ArchiveWaveCompanionStaging(t *testing.T) {
+	root := t.TempDir()
+	metaDir := t.TempDir()
+	listPath := filepath.Join(metaDir, "hsm-bareos-filelist.txt")
+
+	d, f := newCompanionDriver(t, listPath, metaDir, archiveOK("BackupTest", 101), restoreOK())
+
+	obj := filepath.Join(root, "bkt", "key.bin")
+	if err := os.MkdirAll(filepath.Dir(obj), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(obj, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"src":"` + obj + `","attrs":{"tag":"aGk="}}`)
+
+	// The companion mirrors the object's directory under the staging dir
+	// (<MetaStageDir>/<dir-of-object>/<leaf>-<hash16>.hsm-meta). Use the
+	// driver's own helper so the test can't drift from the implementation.
+	wantCompanion := d.companionPathOf(obj)
+
+	// Observe staging state at the moment the job runs (the driver cleans
+	// up the staging copy right after a successful backup, so the
+	// assertions must be taken inside the hook).
+	var seenList, seenCompanion string
+	gotCompanion := false
+	f.onRunJob = func(_ []string) {
+		if b, err := os.ReadFile(listPath); err == nil {
+			seenList = string(b)
+		}
+		if b, err := os.ReadFile(wantCompanion); err == nil {
+			seenCompanion = string(b)
+			gotCompanion = true
+		}
+	}
+
+	_, err := d.ArchiveWave(context.Background(), []WaveFile{{Bucket: "bkt", Key: "key.bin", Path: obj, Size: 7, Meta: payload}})
+	if err != nil {
+		t.Fatalf("ArchiveWave: %v", err)
+	}
+
+	if !gotCompanion {
+		t.Fatalf("companion was never staged at %s", wantCompanion)
+	}
+	if seenCompanion != string(payload) {
+		t.Fatalf("companion content at run time = %q, want %q", seenCompanion, payload)
+	}
+	wantList := obj + "\n" + wantCompanion + "\n"
+	if seenList != wantList {
+		t.Fatalf("due-list at run time = %q, want %q", seenList, wantList)
+	}
+
+	// Staging copies are transient job sources: they must be removed on
+	// success, not left to pollute the scratch dir.
+	if _, err := os.Stat(wantCompanion); !os.IsNotExist(err) {
+		t.Fatalf("companion staging copy must be removed after a successful backup, but %s still exists", wantCompanion)
+	}
+}
+
+// FetchMeta must re-derive the companion from the data locator, restore it,
+// and hand back the exact payload that was staged at archive time. Since
+// the restore job uses Where = /, the driver must issue a restore for the
+// companion path (NOT the data path).
+func TestBareosDriver_FetchMetaRoundTrip(t *testing.T) {
+	metaDir := t.TempDir()
+	d, f := newCompanionDriver(t, "", metaDir, archiveOK("BackupTest", 101), restoreOK())
+
+	obj := "/data/bkt/key.bin"
+	loc := bareosLocator(101, obj)
+	payload := []byte(`{"src":"` + obj + `","attrs":{"tag":"aGk="}}`)
+
+	// The fake does not run bareos-fd, so emulate the documented
+	// Where = / behaviour: when the driver issues a restore for the
+	// companion, write the restored bytes to that exact path (in place).
+	f.onRestore = func(restoreCmd string) {
+		if idx := strings.Index(restoreCmd, "file="); idx >= 0 {
+			target := restoreCmd[idx+len("file="):]
+			os.MkdirAll(filepath.Dir(target), 0o700)
+			os.WriteFile(target, payload, 0o644)
+		}
+	}
+
+	b, err := d.FetchMeta(context.Background(), loc)
+	if err != nil {
+		t.Fatalf("FetchMeta: %v", err)
+	}
+	if string(b) != string(payload) {
+		t.Fatalf("FetchMeta = %q, want %q", b, payload)
+	}
+
+	// The restore must have targeted the COMPANION (not the data path).
+	wantCompanion := companionNameFor(obj)
+	issued := false
+	for _, cmds := range f.got {
+		for _, c := range cmds {
+			if strings.HasPrefix(c, "restore client=") && strings.Contains(c, wantCompanion) {
+				issued = true
+			}
+		}
+	}
+	if !issued {
+		t.Errorf("FetchMeta did not issue a restore for the companion %s; batches: %q", wantCompanion, f.got)
+	}
+}
+
+// A locator for an object archived without a companion (file absent after a
+// clean restore report) must yield an EMPTY payload, not an error: the
+// daemon then skips the replay.
+func TestBareosDriver_FetchMetaNoCompanion(t *testing.T) {
+	metaDir := t.TempDir()
+	d, _ := newCompanionDriver(t, "", metaDir, archiveOK("BackupTest", 101), restoreOK())
+
+	obj := "/data/bkt/key.bin"
+	loc := bareosLocator(101, obj)
+	// The fake restore reports success but writes nothing (no companion was
+	// ever archived). FetchMeta must return empty, without error.
+	b, err := d.FetchMeta(context.Background(), loc)
+	if err != nil {
+		t.Fatalf("FetchMeta(no companion) must not error, got %v", err)
+	}
+	if len(b) != 0 {
+		t.Fatalf("FetchMeta(no companion) = %q, want empty", b)
+	}
+}
+
+// The payload returned by FetchMeta must be one that state.RestoreMeta can
+// actually replay onto an object (the daemon's exact sequence in
+// RestoreJobs), so a sidecar-mode metadata round trip is complete: capture
+// -> archive companion -> fetch -> replay.
+func TestBareosDriver_CompanionReplayRoundTrip(t *testing.T) {
+	metaDir := t.TempDir()
+	d, f := newCompanionDriver(t, "", metaDir, archiveOK("BackupTest", 101), restoreOK())
+
+	payload := []byte(`{"src":"/data/bkt/key.bin","attrs":{"tag":"aGk="}}`)
+	obj := "/data/bkt/key.bin"
+	loc := bareosLocator(101, obj)
+	f.onRestore = func(restoreCmd string) {
+		if idx := strings.Index(restoreCmd, "file="); idx >= 0 {
+			target := restoreCmd[idx+len("file="):]
+			os.MkdirAll(filepath.Dir(target), 0o700)
+			os.WriteFile(target, payload, 0o644)
+		}
+	}
+	b, err := d.FetchMeta(context.Background(), loc)
+	if err != nil {
+		t.Fatalf("FetchMeta: %v", err)
+	}
+
+	// A capturing storer proving the payload replays exactly one attribute
+	// (the HSM state keys are excluded by capture, and "tag" is not one).
+	type recorded struct{ addr, obj, attr string; val []byte }
+	storer := &bareosReplayStorer{}
+	if err := state.RestoreMeta(storer, obj, "", b); err != nil {
+		t.Fatalf("RestoreMeta should accept a payload produced by the driver, got %v", err)
+	}
+	if len(storer.stored) != 1 {
+		t.Fatalf("RestoreMeta replayed %d attributes, want 1: %+v", len(storer.stored), storer.stored)
+	}
+	if got := storer.stored[0]; got.attr != "tag" || string(got.val) != "hi" {
+		t.Fatalf("replayed wrong attribute: %+v", got)
+	}
+}
+
+type bareosReplayStorer struct {
+	stored []struct {
+		addr, obj, attr string
+		val             []byte
+	}
+}
+
+func (s *bareosReplayStorer) RetrieveAttribute(_ *os.File, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
+func (s *bareosReplayStorer) StoreAttribute(_ *os.File, addr, obj, attr string, val []byte) error {
+	s.stored = append(s.stored, struct {
+		addr, obj, attr string
+		val             []byte
+	}{addr, obj, attr, val})
+	return nil
+}
+func (s *bareosReplayStorer) DeleteAttribute(_, _ string, _ string) error { return nil }
+func (s *bareosReplayStorer) DeleteAttributes(_, _ string) error        { return nil }
+func (s *bareosReplayStorer) ListAttributes(addr, object string) ([]string, error) {
+	return nil, nil
+}
+func (s *bareosReplayStorer) RenameObject(_ string, _, _ string) error { return nil }
+
+var _ meta.MetadataStorer = (*bareosReplayStorer)(nil)
+
+// CompanionMeta OFF (xattr mode) must be a hard no-op on both sides: no
+// companions are staged into the due-list, and FetchMeta returns empty
+// without ever talking to bconsole.
+func TestBareosDriver_CompanionMetaOffIsNoop(t *testing.T) {
+	listPath := filepath.Join(t.TempDir(), "list.txt")
+	f := &fakeExec{archive: archiveOK("BackupTest", 101), restore: restoreOK()}
+	d := newBareosDriverWithExec(BareosOpts{
+		Client: "client1", BackupJob: "BackupTest", RestoreJob: "RestoreTest",
+		FileListPath: listPath, Timeout: 5 * time.Second,
+		// CompanionMeta left false (default) -- xattr relies on native transport.
+	}, f.run)
+
+	root := t.TempDir()
+	obj := filepath.Join(root, "bkt", "key.bin")
+	if err := os.MkdirAll(filepath.Dir(obj), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(obj, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"src":"` + obj + `","attrs":{"tag":"aGk="}}`)
+
+	var seenList string
+	f.onRunJob = func(_ []string) {
+		if b, err := os.ReadFile(listPath); err == nil {
+			seenList = string(b)
+		}
+	}
+	if _, err := d.ArchiveWave(context.Background(), []WaveFile{{Path: obj, Size: 7, Meta: payload}}); err != nil {
+		t.Fatalf("ArchiveWave: %v", err)
+	}
+	if strings.Contains(seenList, MetaSuffix) {
+		t.Fatalf("companion must NOT enter the due-list when CompanionMeta is off; list=%q", seenList)
+	}
+
+	loc := bareosLocator(101, obj)
+	nBefore := len(f.got)
+	b, err := d.FetchMeta(context.Background(), loc)
+	if err != nil {
+		t.Fatalf("FetchMeta: %v", err)
+	}
+	if len(b) != 0 {
+		t.Fatalf("FetchMeta(off) = %q, want empty", b)
+	}
+	if len(f.got) != nBefore {
+		t.Fatalf("FetchMeta(off) must not issue any bconsole batch; batches=%q", f.got)
 	}
 }

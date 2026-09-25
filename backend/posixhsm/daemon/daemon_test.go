@@ -381,3 +381,68 @@ func waveCount(calls [][]posixhsm.WaveFile) []int {
 	}
 	return out
 }
+
+// TestDaemonGlacierWorkflowMetaCompanion proves the metadata-survival
+// property over the whole tier → loss-on-source → restore cycle: the
+// object's S3 metadata is captured into a companion by the (mock) driver,
+// the source xattrs are then LOST (e.g. by a sidecar volume loss or by a
+// tier pass on a different host), and the restore must replay the
+// metadata from the archived companion.
+func TestDaemonGlacierWorkflowMetaCompanion(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	d, _, obj := setup(t, now)
+	ctx := context.Background()
+	ms := meta.XattrMeta{}
+
+	// S3-visible metadata on the live object (plus the daemon's own HSM
+	// state keys, which must NOT be captured).
+	if err := ms.StoreAttribute(nil, obj, "", "x-user-critical", []byte("keep-me")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.StoreAttribute(nil, obj, "", "x-user-two", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+
+	// ---- tier: the daemon must snapshot the metadata into a companion ----
+	if tiered, err := d.Tier(ctx); err != nil || tiered != 1 {
+		t.Fatalf("tier: tiered=%d err=%v", tiered, err)
+	}
+	st := state.Store(d.meta, obj)
+	if !st.Offline || st.Locator == "" {
+		t.Fatalf("expected offline state after tier, got %+v", st)
+	}
+
+	// ---- simulate metadata loss on the source (the whole point) ----
+	for _, a := range []string{"x-user-critical", "x-user-two"} {
+		if err := ms.DeleteAttribute(obj, "", a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v, err := ms.RetrieveAttribute(nil, obj, "", "x-user-critical"); err == nil {
+		t.Fatalf("xattr should be gone, got %q", v)
+	}
+
+	// ---- restore ----
+	_, _ = d.q.Enqueue(queue.Job{Op: queue.JobOpRestore, Bucket: "bkt", Key: "object.bin", Days: 3})
+	if n, err := d.RestoreJobs(ctx, 10); err != nil || n != 1 {
+		t.Fatalf("restore: n=%d err=%v", n, err)
+	}
+	// data must be back
+	if b, err := os.ReadFile(obj); err != nil || string(b) != "daemon-e2e-body" {
+		t.Fatalf("data round-trip: %q err=%v", b, err)
+	}
+	// AND the captured S3 metadata must have been replayed from the
+	// companion, even though the source copy is gone.
+	v, err := ms.RetrieveAttribute(nil, obj, "", "x-user-critical")
+	if err != nil || string(v) != "keep-me" {
+		t.Fatalf("x-user-critical = %q (%v), want keep-me (replayed from companion)", v, err)
+	}
+	v, err = ms.RetrieveAttribute(nil, obj, "", "x-user-two")
+	if err != nil || string(v) != "two" {
+		t.Fatalf("x-user-two = %q (%v), want two", v, err)
+	}
+	// HSM state must be offline-cleared, not replayed.
+	if s := state.Store(d.meta, obj); s.Offline {
+		t.Fatal("HSM offline state must not be replayed by the companion")
+	}
+}

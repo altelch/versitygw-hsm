@@ -17,6 +17,8 @@ package posixhsm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,10 +76,10 @@ import (
 //     NOTE: `Full` is the correct *job* level here. (There is no
 //     Director job level called `File` — `File` is a file-daemon *scan*
 //     concept. `Level = File` makes bareos-dir refuse to start.)
-//   - A Restore Job (e.g. "HsmRestore") of Type = Restore whose Where
-//     equals the posix rootdir (default for `where` in the restore
-//     command) -- the bareos-fd must restore the file back to its
-//     original location so the live inode + xattrs are preserved.
+//   - A Restore Job (e.g. "HsmRestore") of Type = Restore whose
+//     Where = / (restore to original location) -- the bareos-fd must
+//     restore the file back to its on-disk location so the live inode
+//     + xattrs are preserved.
 //
 // Why the due-file list matters: the job must NOT archive a static
 // directory. After tiering truncates an object to 0 bytes, a
@@ -137,11 +139,31 @@ type BareosOpts struct {
 	// Timeout bounds a single bconsole batch (which may internally block
 	// on `wait` for the job to complete). Default: 10m.
 	Timeout time.Duration
+
+	// CompanionMeta enables archiving the daemon's WaveFile.Meta snapshot
+	// as a companion file in the SAME backup job, so sidecar-mode metadata
+	// (which lives OUTSIDE the rootdir and is therefore invisible to the
+	// fd's xattr/scan machinery) survives with the object. When false (the
+	// default) the driver relies on the fd's native xattr transport, which
+	// is correct for xattr mode. See the FetchMeta / companionStaging docs.
+	CompanionMeta bool
+
+	// MetaStageDir is the scratch directory the driver uses to stage the
+	// companion files before they ride in the due-list (backup) and the
+	// place the fd writes them back to on restore (Where = / puts the
+	// restore at the original location, i.e. back into this directory).
+	// It must sit OUTSIDE the posix rootdir -- the daemon's object
+	// lister must never see companions as data objects -- and OUTSIDE the
+	// FileSet's static include set. Default: the system temp dir.
+	MetaStageDir string
 }
 
 func (o *BareosOpts) withDefaults() {
 	if o.Timeout <= 0 {
 		o.Timeout = 10 * time.Minute
+	}
+	if o.CompanionMeta && o.MetaStageDir == "" {
+		o.MetaStageDir = os.TempDir()
 	}
 }
 
@@ -444,13 +466,21 @@ func truncated(b []byte, n int) string {
 // --- HsmDriver -----------------------------------------------------------------
 
 // writeFileList atomically rewrites opts.FileListPath with one absolute
-// file path per line (the due set of this wave/pass). The backup job's
-// FileSet reads this file on the fd (`File = "<file")`.
-func (d *BareosHsmDriver) writeFileList(files []WaveFile) error {
+// file path per line (the due set of this wave/pass plus its metadata
+// companions, when CompanionMeta is on). The backup job's FileSet reads
+// this file on the fd (`File = "<file`): the docs guarantee an explicitly
+// listed file is saved at job start even when it lies outside the
+// FileSet's static include set, which is how companions staged OUTSIDE
+// the rootdir ride in the same job.
+func (d *BareosHsmDriver) writeFileList(files []WaveFile, companions []string) error {
 	var b bytes.Buffer
-	b.Grow(len(files) * 64)
+	b.Grow((len(files) + len(companions)) * 64)
 	for _, f := range files {
 		b.WriteString(f.Path)
+		b.WriteByte('\n')
+	}
+	for _, c := range companions {
+		b.WriteString(c)
 		b.WriteByte('\n')
 	}
 
@@ -478,6 +508,72 @@ func (d *BareosHsmDriver) writeFileList(files []WaveFile) error {
 	return nil
 }
 
+// companionNameFor returns the deterministic companion file name for the
+// live object at path: <leaf>-<hex16(sha256(dir:leaf))>.hsm-meta. The
+// hash covers the directory AS WELL as the leaf so two objects sharing a
+// leaf name never collide, and it is derived from the full live path so
+// the archive side (ArchiveWave) and the fetch side (FetchMeta) agree
+// with no persisted record -- the same principle as the TSM driver's
+// MetaName.
+func companionNameFor(path string) string {
+	dir := filepath.Dir(path)
+	leaf := filepath.Base(path)
+	sum := sha256.Sum256([]byte(dir + ":" + leaf))
+	h16 := hex.EncodeToString(sum[:metaNameHashBytes])
+	return leaf + "-" + h16 + MetaSuffix
+}
+
+// companionPathOf returns the location a companion file lives in (and is
+// restored back to, since the restore job uses Where = /):
+// <MetaStageDir>/<dir-of-path>/<companionName>.
+func (d *BareosHsmDriver) companionPathOf(path string) string {
+	stageDir := d.opts.MetaStageDir
+	if stageDir == "" {
+		stageDir = os.TempDir()
+	}
+	return filepath.Join(stageDir, filepath.Dir(path), companionNameFor(path))
+}
+
+// stageCompanion writes a file's WaveFile.Meta snapshot to its companion
+// staging path (temp + rename so bareos-fd can never read a partial
+// companion). It must land OUTSIDE the posix rootdir so the daemon's
+// object lister does not see companions as data objects.
+func (d *BareosHsmDriver) stageCompanion(path string, payload []byte) (string, error) {
+	target := d.companionPathOf(path)
+	cdir := filepath.Dir(target)
+	if err := os.MkdirAll(cdir, 0o700); err != nil {
+		return "", fmt.Errorf("bareos driver: mkdir companion dir %q: %w", cdir, err)
+	}
+	f, err := os.CreateTemp(cdir, ".hsm-meta-*")
+	if err != nil {
+		return "", fmt.Errorf("bareos driver: stage companion for %q: %w", path, err)
+	}
+	tmp := f.Name()
+	if _, err := f.Write(payload); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", fmt.Errorf("bareos driver: write companion for %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("bareos driver: close companion for %q: %w", path, err)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("bareos driver: install companion for %q: %w", path, err)
+	}
+	return target, nil
+}
+
+// removeCompanionStaging best-effort unlinks companion staging files left
+// over from a failed wave (they are transient; on failure they are left
+// for the OS / the next pass).
+func (d *BareosHsmDriver) removeCompanionStaging(paths []string) {
+	for _, p := range paths {
+		_ = os.Remove(p)
+	}
+}
+
 func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]string, error) {
 	if len(files) == 0 {
 		return nil, nil
@@ -499,17 +595,45 @@ func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]
 		}
 	}
 
+	// Companion metadata (sidecar mode): stage every file carrying a
+	// WaveFile.Meta snapshot outside the rootdir and extend the due-list
+	// with the companion paths, so the fd archives them as full files in
+	// this very job. The companion name is deterministic (see
+	// companionNameFor), so FetchMeta can re-derive it from the data
+	// locator's path alone.
+	var companions []string
+	if d.opts.CompanionMeta {
+		for _, f := range files {
+			if len(f.Meta) == 0 {
+				continue
+			}
+			c, serr := d.stageCompanion(f.Path, f.Meta)
+			if serr != nil {
+				// Clean up whatever staged so far; the wave must fail
+				// atomically with no partial staging left behind.
+				d.removeCompanionStaging(companions)
+				return nil, serr
+			}
+			companions = append(companions, c)
+		}
+	}
+
 	// The job's FileSet reads the per-pass list at FileListPath (`File =
-	// "< file"`) and Level=Full saves exactly these files, so a truncate
-	// from an earlier pass can never make it into the archive and no
-	// not-yet-due object rides along. Atomic write (temp + rename) so the
-	// fd can never observe a half-written list.
-	if err := d.writeFileList(files); err != nil {
+	// "< file"`) and Level=Full saves exactly these files (plus the
+	// companions appended below), so a truncate from an earlier pass can
+	// never make it into the archive and no not-yet-due object rides
+	// along. Atomic write (temp + rename) so the fd can never observe a
+	// half-written list.
+	if err := d.writeFileList(files, companions); err != nil {
+		d.removeCompanionStaging(companions)
 		return nil, err
 	}
 
 	// Batch: enable JSON api, run the backup job, wait, drain messages,
 	// then query the catalog for the most recent JobId for the job name.
+	// Any failure below must also clean up the staged companions (they are
+	// transient scratch, and a half-written sidecar would otherwise ride
+	// into the next job or be restored by a later FetchMeta).
 	out, err := d.bareosSend(ctx,
 		".api 2",
 		"run job="+d.opts.BackupJob,
@@ -518,17 +642,21 @@ func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]
 		"list jobs",
 	)
 	if err != nil {
+		d.removeCompanionStaging(companions)
 		return nil, fmt.Errorf("bareos driver: bconsole run %q: %w (output: %s)", d.opts.BackupJob, err, truncated(out, 400))
 	}
 	tail := extractTermination(out)
 	if tail == "" {
+		d.removeCompanionStaging(companions)
 		return nil, fmt.Errorf("bareos driver: no Termination: line in job report: %s", truncated(out, 400))
 	}
 	if !isOKTermination(tail) {
+		d.removeCompanionStaging(companions)
 		return nil, fmt.Errorf("bareos driver: job %q reported: %q (output: %s)", d.opts.BackupJob, tail, truncated(out, 400))
 	}
 	jobid := lookupJobID(out, d.opts.BackupJob)
 	if jobid <= 0 {
+		d.removeCompanionStaging(companions)
 		return nil, fmt.Errorf("bareos driver: unable to determine JobId for job %q from list-jobs output: %s",
 			d.opts.BackupJob, truncated(out, 400))
 	}
@@ -536,6 +664,11 @@ func (d *BareosHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]
 	for i, f := range files {
 		locs[i] = bareosLocator(jobid, f.Path)
 	}
+	// The companions are archived; the staging copies are just the job's
+	// on-disk source and must not linger (they are outside the rootdir,
+	// so they would simply pollute the scratch dir -- but they must never
+	// be re-typed on a later pass or mistaken for live companions).
+	d.removeCompanionStaging(companions)
 	return locs, nil
 }
 
@@ -578,6 +711,60 @@ func (d *BareosHsmDriver) Purge(ctx context.Context, locator string) error {
 	// unknown locator is not an error, so we satisfy it as a documented no-op.
 	_ = locator
 	return nil
+}
+
+var _ MetaPayload = (*BareosHsmDriver)(nil)
+
+// FetchMeta implements MetaPayload for the sidecar companion. The data
+// locator's path identifies the object, and the companion name is derived
+// deterministically from that path (companionNameFor), so no bookkeeping is
+// needed. The restore job's Where = / puts the companion back at its
+// ORIGINAL location (the driver's staging dir), so we restore exactly that
+// path and read the file back.
+//
+// A locator whose object was archived WITHOUT a companion (CompanionMeta
+// off, empty Meta, or archived before this feature existed) must yield an
+// empty payload, not an error: the daemon then skips the replay. We cannot
+// tell the two cases apart from the bconsole report alone, so the caller's
+// contract is: an empty file read-back means "no companion" only when the
+// restore reported success on an empty/absent payload; a hard bconsole
+// failure OR a missing file after a nominal success is surfaced as an
+// error so the daemon can retry.
+func (d *BareosHsmDriver) FetchMeta(ctx context.Context, locator string) ([]byte, error) {
+	jobid, dataPath, ok := parseBareosLocator(locator)
+	if !ok {
+		return nil, fmt.Errorf("bareos driver: malformed locator %q", locator)
+	}
+	if !d.opts.CompanionMeta {
+		return nil, nil // this store does not keep a companion
+	}
+	companion := d.companionPathOf(dataPath)
+
+	out, err := d.bareosSend(ctx,
+		".api 2",
+		fmt.Sprintf("restore client=%s jobid=%d file=%s", d.opts.Client, jobid, consoleQuote(companion)),
+		fmt.Sprintf("restorejob=%s", d.opts.RestoreJob),
+		"yes",
+		"wait",
+		"messages",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("bareos driver: restore companion %s (jobid=%d): %w (output: %s)", companion, jobid, err, truncated(out, 400))
+	}
+	tail := extractTermination(out)
+	if tail == "" || !isOKTermination(tail) {
+		return nil, fmt.Errorf("bareos driver: restore companion %s did not complete: %q (output: %s)", companion, tail, truncated(out, 400))
+	}
+	b, rerr := os.ReadFile(companion)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			// Job said OK but the file is not there: the catalog held no
+			// such file (no companion was archived for this object).
+			return nil, nil
+		}
+		return nil, fmt.Errorf("bareos driver: read restored companion %q: %w", companion, rerr)
+	}
+	return b, nil
 }
 
 func (d *BareosHsmDriver) Close() error { return nil }

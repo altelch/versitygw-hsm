@@ -8,7 +8,7 @@
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
+// KIND, either express or implied.  See the license for the
 // specific language governing permissions and limitations
 // under the License.
 
@@ -21,10 +21,19 @@ import (
 
 // WaveFile is one object within an archive wave.
 // Path is the absolute path to the live object file; Size is its byte
-// count. Drivers use these to read the data.
+// count. Bucket and Key are the S3 coordinates the daemon used to address
+// the object (they also anchor the metadata companion name, see MetaName).
 type WaveFile struct {
-	Path string
-	Size int64
+	Bucket string
+	Key    string
+	Path   string
+	Size   int64
+	// Meta is the object's S3-metadata snapshot as captured by the
+	// daemon (see state.CaptureMeta). Drivers archive it as a companion
+	// object named MetaName(hl, ll) alongside the data, so that a
+	// standalone (non-daemon) restore — e.g. tsmapi restore — can replay
+	// the metadata. Empty when there is nothing to capture.
+	Meta []byte
 }
 
 // HsmDriver abstracts the secondary store a daemon uses to bulk-move
@@ -45,10 +54,11 @@ type HsmDriver interface {
 	Name() string
 
 	// ArchiveWave reads each WaveFile.Path and stores its data on the
-	// secondary store. On success it returns one locator per file
-	// (same order as input) usable with Restore and Purge. On any
-	// failure, all files in the wave are left unmodified on disk and
-	// the error is returned.
+	// secondary store. Drivers that understand WaveFile.Meta also store
+	// the metadata companion (see MetaPayload). On success it returns
+	// one locator per file (same order as input) usable with Restore,
+	// Purge and FetchMeta. On any failure, all files in the wave are
+	// left unmodified on disk and the error is returned.
 	ArchiveWave(ctx context.Context, files []WaveFile) ([]string, error)
 
 	// Restore materializes one object: it reads the data identified by
@@ -58,9 +68,26 @@ type HsmDriver interface {
 	Restore(ctx context.Context, locator string, wr io.Writer, size int64) error
 
 	// Purge removes the secondary-store copy identified by locator.
-	// Idempotent: purging an unknown locator is not an error.
+	// Idempotent: purging an unknown locator is not an error. Drivers
+	// that store metadata companions remove them here as well.
 	Purge(ctx context.Context, locator string) error
 
 	// Close releases resources held by the driver.
 	Close() error
+}
+
+// MetaPayload is the optional extension implemented by drivers that
+// archive an object's S3 metadata as a companion object and can fetch it
+// back. The daemon calls FetchMeta during RestoreJobs (after the data
+// restore, before ClearOffline) to replay the captured metadata onto the
+// live object via state.RestoreMeta. Drivers WITHOUT this extension leave
+// the metadata on the live object as-is, which is correct for xattr mode
+// (the metadata survives on the live file) and for Bareos (whose file
+// daemon transports xattrs natively).
+type MetaPayload interface {
+	// FetchMeta returns the metadata companion of the object identified
+	// by locator (the same locator ArchiveWave produced for the data),
+	// or an empty payload when no companion was archived. An error means
+	// the companion exists but could not be read.
+	FetchMeta(ctx context.Context, locator string) ([]byte, error)
 }

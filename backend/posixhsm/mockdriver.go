@@ -16,6 +16,8 @@ package posixhsm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +48,7 @@ type MockDriver struct {
 }
 
 var _ HsmDriver = (*MockDriver)(nil)
+var _ MetaPayload = (*MockDriver)(nil)
 
 // NewMockDriver creates a mock driver rooted at dir, creating the mock
 // data directory and data file if needed.
@@ -71,8 +74,35 @@ func NewMockDriver(dir string) (*MockDriver, error) {
 
 func (m *MockDriver) Name() string { return "mock" }
 
-func (m *MockDriver) makeLocator(off, length int64) string {
-	return "mock:" + m.dataPath + ":" + strconv.FormatInt(off, 10) + ":" + strconv.FormatInt(length, 10)
+func (m *MockDriver) metaDir() string { return filepath.Join(m.dir, "mock", "meta") }
+
+func (m *MockDriver) makeLocator(off, length int64, metaName string) string {
+	b := "mock:" + m.dataPath + ":" + strconv.FormatInt(off, 10) + ":" + strconv.FormatInt(length, 10)
+	if metaName != "" {
+		b += ":m=" + metaName
+	}
+	return b
+}
+
+// metaNameOf extracts the ":m=<name>" companion encoding from a mock
+// locator, returning "" when the locator carries no companion.
+func metaNameOf(loc string) string {
+	const mark = ":m="
+	i := strings.LastIndex(loc, mark)
+	if i < 0 {
+		return ""
+	}
+	return loc[i+len(mark):]
+}
+
+// stripMeta removes the ":m=<name>" suffix (if any) from a mock locator,
+// leaving the plain "mock:<path>:<off>:<len>" form for parseLocator.
+func stripMeta(loc string) string {
+	const mark = ":m="
+	if i := strings.LastIndex(loc, mark); i >= 0 {
+		return loc[:i]
+	}
+	return loc
 }
 
 // parseLocator splits "mock:<path>:<off>:<len>" into its components using
@@ -108,55 +138,90 @@ func parseLocator(loc string) (path string, offset, length int64, err error) {
 
 func (m *MockDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]string, error) {
 	locs := make([]string, len(files))
-	// Phase 1: allocate contiguous offsets for every file. If any file is
-	// unreadable at archive time the whole wave fails (files unmodified).
+	// Data objects go into the shared data file (append, atomic offsets).
+	// Metadata companions — when present — are written as one self-contained
+	// file each under <dir>/mock/meta/, so they are independently
+	// addressable (FetchMeta) and purgeable without rewriting the data
+	// file. The companion file name is a stable hash of the object's live
+	// path, and it is also encoded into the locator (":m=<name>") so that
+	// FetchMeta/Purge — which only see the locator — can find it.
+	metaDir := filepath.Join(m.dir, "mock", "meta")
+
+	// Reserve contiguous offsets for the data objects.
 	offsets := make([]int64, len(files))
-	m.mu.Lock()
-	var base int64 = int64(m.next.Load())
-	for i, f := range files {
+	for _, f := range files {
 		if f.Size < 0 {
-			m.mu.Unlock()
 			return nil, fmt.Errorf("mock driver: negative size for %s", f.Path)
 		}
+	}
+	m.mu.Lock()
+	base := int64(m.next.Load())
+	for i, f := range files {
 		offsets[i] = base
 		base += f.Size
 	}
 	m.next.Store(uint64(base))
 	m.mu.Unlock()
 
-	// Phase 2: read each file and write at its reserved offset.
-	f, err := os.OpenFile(m.dataPath, os.O_WRONLY, 0o644)
+	// Write data objects.
+	fh, err := os.OpenFile(m.dataPath, os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("mock driver: open: %w", err)
 	}
-	defer f.Close()
 	for i, wf := range files {
-		if wf.Size == 0 {
-			locs[i] = m.makeLocator(offsets[i], 0)
+		if wf.Size > 0 {
+			src, err := os.Open(wf.Path)
+			if err != nil {
+				fh.Close()
+				return nil, fmt.Errorf("mock driver: open %s: %w", wf.Path, err)
+			}
+			if _, s_err := fh.Seek(offsets[i], io.SeekStart); s_err != nil {
+				src.Close()
+				fh.Close()
+				return nil, fmt.Errorf("mock driver: seek to %d: %w", offsets[i], s_err)
+			}
+			nw, cerr := io.CopyN(fh, src, wf.Size)
+			src.Close()
+			if cerr != nil && !errors.Is(cerr, io.EOF) {
+				fh.Close()
+				return nil, fmt.Errorf("mock driver: append %s: %w", wf.Path, cerr)
+			}
+			if nw != wf.Size {
+				fh.Close()
+				return nil, fmt.Errorf("mock driver: short write for %s: %d != %d", wf.Path, nw, wf.Size)
+			}
+		}
+		locs[i] = m.makeLocator(offsets[i], wf.Size, "") // meta name set below if present
+	}
+	fh.Close()
+
+	// Write metadata companions and record their name in the locator.
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mock driver: mkdir meta: %w", err)
+	}
+	for i, wf := range files {
+		if len(wf.Meta) == 0 {
 			continue
 		}
-		if _, s_err := f.Seek(offsets[i], io.SeekStart); s_err != nil {
-			return nil, fmt.Errorf("mock driver: seek to %d: %w", offsets[i], s_err)
+		metaName := metaCompanionName(wf.Path)
+		metaPath := filepath.Join(metaDir, metaName)
+		if err := os.WriteFile(metaPath, wf.Meta, 0o644); err != nil {
+			return nil, fmt.Errorf("mock driver: write meta %s: %w", metaPath, err)
 		}
-		src, err := os.Open(wf.Path)
-		if err != nil {
-			return nil, fmt.Errorf("mock driver: open %s: %w", wf.Path, err)
-		}
-		nw, cerr := io.CopyN(f, src, wf.Size)
-		src.Close()
-		if cerr != nil && !errors.Is(cerr, io.EOF) {
-			return nil, fmt.Errorf("mock driver: append %s: %w", wf.Path, cerr)
-		}
-		if nw != wf.Size {
-			return nil, fmt.Errorf("mock driver: short write for %s: wrote %d, want %d", wf.Path, nw, wf.Size)
-		}
-		locs[i] = m.makeLocator(offsets[i], wf.Size)
+		locs[i] = m.makeLocator(offsets[i], wf.Size, metaName)
 	}
 	return locs, nil
 }
 
+// metaCompanionName derives a stable, filesystem-safe companion file name
+// from an object's live path (sha256, hex-encoded).
+func metaCompanionName(livePath string) string {
+	sum := sha256.Sum256([]byte(livePath))
+	return hex.EncodeToString(sum[:16]) + MetaSuffix
+}
+
 func (m *MockDriver) Restore(ctx context.Context, locator string, wr io.Writer, size int64) error {
-	path, offset, length, err := parseLocator(locator)
+	path, offset, length, err := parseLocator(stripMeta(locator))
 	if err != nil {
 		return err
 	}
@@ -184,11 +249,33 @@ func (m *MockDriver) Restore(ctx context.Context, locator string, wr io.Writer, 
 	return nil
 }
 
-func (m *MockDriver) Purge(_ context.Context, _ string) error {
-	// The mock stores ranges inside a shared file and cannot reclaim space
-	// without a rewrite; Purge is a no-op satisfying the idempotent
-	// contract.
+func (m *MockDriver) Purge(_ context.Context, locator string) error {
+	// The mock stores data ranges inside a shared file and cannot reclaim
+	// that space without a rewrite, but the metadata companion is a real
+	// file and IS removed to honour the idempotent contract (and to avoid
+	// leaking the payload).
+	if name := metaNameOf(locator); name != "" {
+		_ = os.Remove(filepath.Join(m.metaDir(), name))
+	}
 	return nil
+}
+
+// FetchMeta implements MetaPayload: it returns the archived metadata
+// companion for the object described by locator. A locator without a
+// companion (":m=" absent) yields an empty payload, not an error.
+func (m *MockDriver) FetchMeta(ctx context.Context, locator string) ([]byte, error) {
+	name := metaNameOf(locator)
+	if name == "" {
+		return nil, nil // no companion was archived
+	}
+	b, err := os.ReadFile(filepath.Join(m.metaDir(), name))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("mock driver: read meta %q: %w", name, err)
+	}
+	return b, nil
 }
 
 func (m *MockDriver) Close() error { return nil }

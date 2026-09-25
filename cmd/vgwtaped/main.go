@@ -53,12 +53,14 @@ var (
 	bareosConf     string
 	bareosDirector string
 	bareosFilelist string
+	bareosMetaDir  string
 	tsmNode        string
 	tsmOwner       string
 	tsmFilespace   string
 	tsmHelper      string
 	tsmClientDir   string
 	tsmOptions     string
+	tsmTmpDir      string
 	zfsDataset     string
 	wg             sync.WaitGroup
 	workers        int
@@ -76,6 +78,30 @@ func buildDriver(absRoot string) (posixhsm.HsmDriver, error) {
 		if filelist == "" {
 			filelist = filepath.Join(stateDir, "hsm-bareos-filelist.txt")
 		}
+		metaDir := bareosMetaDir
+		if metaDir == "" {
+			metaDir = stateDir
+		}
+		// In sidecar mode the S3 metadata lives OUTSIDE the rootdir, so
+		// the fd's native xattr/scan machinery never sees it: the driver
+		// must carry it as a companion file in the backup job. In xattr
+		// mode the fd transports xattrs natively, so a companion would be
+		// a duplicate -- CompanionMeta stays off (the default).
+		companion := sidecarDir != ""
+		// The companion staging dir must NEVER sit inside the rootdir, or
+		// the daemon's object lister would see each companion as a data
+		// object and tier IT too (a self-tiering loop). Default to the
+		// state dir, but reject a state dir that is itself under the root.
+		if companion {
+			absMetaDir, merr := filepath.Abs(metaDir)
+			if merr != nil {
+				return nil, fmt.Errorf("resolve bareos metadata staging dir: %w", merr)
+			}
+			if absMetaDir == absRoot || strings.HasPrefix(absMetaDir, absRoot+string(filepath.Separator)) {
+				return nil, fmt.Errorf("--bareos-metatmpdir %q must be OUTSIDE --rootdir %q (the daemon would tier the companions as data objects)", absMetaDir, absRoot)
+			}
+			metaDir = absMetaDir
+		}
 		return posixhsm.NewBareosDriver(posixhsm.BareosOpts{
 			Client:         bareosClient,
 			BackupJob:      bareosBackup,
@@ -83,11 +109,17 @@ func buildDriver(absRoot string) (posixhsm.HsmDriver, error) {
 			BConsoleConfig: bareosConf,
 			Director:       bareosDirector,
 			FileListPath:   filelist,
+			CompanionMeta:  companion,
+			MetaStageDir:   metaDir,
 		})
 	case "tsm":
 		fs := tsmFilespace
 		if fs == "" {
 			fs = absRoot
+		}
+		tmp := tsmTmpDir
+		if tmp == "" {
+			tmp = stateDir
 		}
 		return posixhsm.NewTsmDriver(posixhsm.TsmOpts{
 			Node:       tsmNode,
@@ -96,6 +128,7 @@ func buildDriver(absRoot string) (posixhsm.HsmDriver, error) {
 			HelperPath: tsmHelper,
 			ClientDir:  tsmClientDir,
 			Options:    tsmOptions,
+			TmpDir:     tmp,
 		}, absRoot)
 	default:
 		return nil, fmt.Errorf("unknown driver %q (supported: mock, bareos, tsm)", driverName)
@@ -288,12 +321,14 @@ func main() {
 		&cli.StringFlag{Name: "bareos-conf", Usage: "bconsole -c config dir/file (defines the Director to talk to)", EnvVars: []string{"VGWTAPED_BAREOS_CONF"}, Destination: &bareosConf},
 		&cli.StringFlag{Name: "bareos-director", Usage: "bconsole -D directory (named console), optional", EnvVars: []string{"VGWTAPED_BAREOS_DIRECTOR"}, Destination: &bareosDirector},
 		&cli.StringFlag{Name: "bareos-filelist", Usage: "due-file list for the backup job's FileSet (fd must read it; default: <state-dir>/hsm-bareos-filelist.txt)", EnvVars: []string{"VGWTAPED_BAREOS_FILELIST"}, Destination: &bareosFilelist},
+		&cli.StringFlag{Name: "bareos-metatmpdir", Usage: "scratch dir (outside --rootdir) for the sidecar-mode metadata companions; only used with --sidecar; default: <state-dir>", EnvVars: []string{"VGWTAPED_BAREOS_METADIR"}, Destination: &bareosMetaDir},
 		&cli.StringFlag{Name: "tsm-node", Usage: "TSM (IBM Storage Protect) client node name to sign on as (with --driver tsm)", EnvVars: []string{"VGWTAPED_TSM_NODE"}, Destination: &tsmNode},
 		&cli.StringFlag{Name: "tsm-owner", Usage: "TSM owner name; defaults to --tsm-node", EnvVars: []string{"VGWTAPED_TSM_OWNER"}, Destination: &tsmOwner},
 		&cli.StringFlag{Name: "tsm-filespace", Usage: "TSM filespace scope for hl/ll; defaults to --rootdir", EnvVars: []string{"VGWTAPED_TSM_FILESPACE"}, Destination: &tsmFilespace},
 		&cli.StringFlag{Name: "tsm-helper", Usage: "path to the tsmapi C helper (build: hsmtools/tsmapi); default: tsmapi on $PATH", EnvVars: []string{"VGWTAPED_TSM_HELPER", "TSM_HELPER"}, Destination: &tsmHelper},
 		&cli.StringFlag{Name: "tsm-clientdir", Usage: "TSM client config dir holding dsm.sys/dsm.opt/dsmkey (must be writable by the daemon user, and may hold NLS catalogs); default: /opt/tivoli/tsm/client/ba/bin", EnvVars: []string{"VGWTAPED_TSM_CLIENTDIR"}, Destination: &tsmClientDir},
 		&cli.StringFlag{Name: "tsm-options", Usage: "inline dsmInitEx option string (e.g. mgmt-class override), optional", EnvVars: []string{"VGWTAPED_TSM_OPTIONS"}, Destination: &tsmOptions},
+		&cli.StringFlag{Name: "tsm-tmpdir", Usage: "scratch dir for the tsm companion staging (metadata sidecar) and the NDJSON helper output; default: <state-dir>", EnvVars: []string{"VGWTAPED_TSM_TMPDIR"}, Destination: &tsmTmpDir},
 		&cli.StringFlag{Name: "zfs-dataset", Usage: "ZFS dataset name to tier (enables incremental scan via zfs diff; mount point must equal --rootdir)", EnvVars: []string{"VGWTAPED_ZFS_DATASET"}, Destination: &zfsDataset},
 		&cli.IntFlag{Name: "workers", Value: 4, Usage: "number of concurrent restore workers", EnvVars: []string{"VGWTAPED_WORKERS"}, Destination: &workers},
 		&cli.DurationFlag{Name: "scan-interval", Value: 5 * time.Minute, Usage: "interval between tier/sweep/gc passes", EnvVars: []string{"VGWTAPED_SCAN_INTERVAL"}, Destination: &scanInterval},

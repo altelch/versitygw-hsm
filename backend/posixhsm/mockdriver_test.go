@@ -126,3 +126,89 @@ func TestMockDriver_RestoreRejectsLengthMismatch(t *testing.T) {
 		t.Fatalf("expected length-mismatch error, got %d bytes", buf.Len())
 	}
 }
+
+// TestMockDriver_MetaCompanionRoundTrip drives the companion contract:
+// archive with a Meta snapshot → FetchMeta round-trips the payload → the
+// locator alone is sufficient to find it → Purge removes the companion
+// (and only for the companion-bearing locator).
+func TestMockDriver_MetaCompanionRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	d, err := NewMockDriver(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	src := seedFile(t, t.TempDir(), "object.dat", "data-payload")
+	const payload = `{"src":"x","attrs":{"x-user-a":"Yg=="}}` // base64("v")
+
+	locs, err := d.ArchiveWave(ctx, []WaveFile{{
+		Path: src,
+		Size: int64(len("data-payload")),
+		Meta: []byte(payload),
+	}})
+	if err != nil {
+		t.Fatalf("ArchiveWave: %v", err)
+	}
+	loc := locs[0]
+	if !strings.Contains(loc, ":m=") {
+		t.Fatalf("locator %q must encode the companion name", loc)
+	}
+
+	got, err := d.FetchMeta(ctx, loc)
+	if err != nil {
+		t.Fatalf("FetchMeta: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("FetchMeta returned %q, want %q", got, payload)
+	}
+
+	// A locator without a companion must yield an empty payload, no error.
+	plainLocs, err := d.ArchiveWave(ctx, []WaveFile{{
+		Path: seedFile(t, t.TempDir(), "plain.dat", "plain"),
+		Size: 5,
+	}})
+	if err != nil {
+		t.Fatalf("ArchiveWave(plain): %v", err)
+	}
+	empty, err := d.FetchMeta(ctx, plainLocs[0])
+	if err != nil {
+		t.Fatalf("FetchMeta(plain) must not fail: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("FetchMeta(plain) = %q, want empty", empty)
+	}
+
+	// Purge removes the companion file.
+	if err := d.Purge(ctx, loc); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if _, err := d.FetchMeta(ctx, loc); err != nil {
+		t.Fatalf("FetchMeta after purge should be empty, not %v", err)
+	}
+
+	// The data payload is still restorable (purge did not break the
+	// shared data file).
+	var buf bytes.Buffer
+	if err := d.Restore(ctx, loc, &buf, int64(len("data-payload"))); err != nil {
+		t.Fatalf("Restore after purge: %v", err)
+	}
+	if buf.String() != "data-payload" {
+		t.Fatalf("data after purge = %q", buf.String())
+	}
+}
+
+// TestMockDriver_MetaNameIsStable verifies the companion name is a pure
+// function of the live path (so archive and purge/fetch always agree).
+func TestMockDriver_MetaNameIsStable(t *testing.T) {
+	if metaCompanionName("/root/bkt/key") != metaCompanionName("/root/bkt/key") {
+		t.Fatal("metaCompanionName is not deterministic")
+	}
+	if !strings.HasSuffix(metaCompanionName("/root/bkt/key"), MetaSuffix) {
+		t.Fatal("metaCompanionName must end with the .hsm-meta suffix")
+	}
+	if metaCompanionName("/a/b") == metaCompanionName("/c/d") {
+		t.Fatal("distinct live paths must map to distinct companion names")
+	}
+}

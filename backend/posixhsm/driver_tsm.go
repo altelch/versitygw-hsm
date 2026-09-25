@@ -135,6 +135,12 @@ type TsmOpts struct {
 	// Options is the inline option string to pass to dsmInitEx. Optional.
 	Options string
 
+	// TmpDir is where the driver stages metadata companion payloads
+	// before sending them (the helper's `send` reads a real file).
+	// Defaults to os.TempDir(). Created on demand; the driver removes
+	// the staging file after each successful wave.
+	TmpDir string
+
 	// Timeout bounds one helper batch (signon + op + quit). The daemon's
 	// overall pass timeout is what actually bounds a long restore.
 	// Default: 30m.
@@ -168,6 +174,11 @@ func (o *TsmOpts) withDefaults() {
 type TsmHsmDriver struct {
 	opts TsmOpts
 	run  tsmRun
+	// metaStaging holds the on-disk paths of metadata companion payloads
+	// staged for the in-flight ArchiveWave. It is cleared after the wave
+	// completes (success or failure). The driver is used by a single
+	// daemon at a time, so no locking is required.
+	metaStaging []string
 }
 
 var _ HsmDriver = (*TsmHsmDriver)(nil)
@@ -264,18 +275,66 @@ type tsmQ struct {
 // tsmBatch runs one helper process with the given request lines and returns
 // the last response line (the response to the operation of interest). The
 // helper is synchronous and replies line-for-line in order, so the final
-// non-JSON noise-free line in the stdout buffer is the operation result.
-func (d *TsmHsmDriver) tsmBatch(ctx context.Context, lines []string) (*tsmResp, error) {
+// JSON line in the stdout buffer is the last operation result. Callers
+// whose batch contains MULTIPLE operations (e.g. ArchiveWave with metadata
+// companions) must additionally run checkAllOK on the raw output, because
+// a mid-batch failure would be masked by a successful final line.
+func (d *TsmHsmDriver) tsmBatch(ctx context.Context, lines []string) (*tsmResp, []byte, error) {
 	out, err := d.run(ctx, d.opts.HelperPath, lines)
 	if err != nil {
-		return nil, fmt.Errorf("tsm driver: helper %s: %w (output: %s)", d.opts.HelperPath, err, truncated(out, 400))
+		return nil, out, fmt.Errorf("tsm driver: helper %s: %w (output: %s)", d.opts.HelperPath, err, truncated(out, 400))
 	}
 	line := lastJSONLine(out)
 	var r tsmResp
 	if e := json.Unmarshal(line, &r); e != nil {
-		return nil, fmt.Errorf("tsm driver: malformed helper response %q: %w", truncate(string(line), 200), e)
+		return nil, out, fmt.Errorf("tsm driver: malformed helper response %q: %w", truncate(string(line), 200), e)
 	}
-	return &r, nil
+	return &r, out, nil
+}
+
+// anyLineFailed reports whether any JSON response line in out carries
+// "ok":false. Lines that are not JSON (DAPI diagnostics) are ignored.
+func anyLineFailed(out []byte) bool {
+	for _, l := range lastJSONLines(out, 0) {
+		var r tsmResp
+		if json.Unmarshal(l, &r) == nil && !r.OK {
+			return true
+		}
+	}
+	return false
+}
+
+// firstFailedReason returns the first "msg" (or "op") found on a failing
+// response line, for a concise error message.
+func firstFailedReason(out []byte) string {
+	for _, l := range lastJSONLines(out, 0) {
+		var r tsmResp
+		if json.Unmarshal(l, &r) == nil && !r.OK {
+			if r.Msg != "" {
+				return r.Msg
+			}
+			return "op=" + r.Op
+		}
+	}
+	return "unknown helper failure"
+}
+
+// lastJSONLines returns every line in out that parses as a JSON object.
+// n=0 means all.
+func lastJSONLines(out []byte, n int) [][]byte {
+	lines := bytes.Split(out, []byte("\n"))
+	var res [][]byte
+	for i := len(lines) - 1; i >= 0 && (n == 0 || len(res) < n); i-- {
+		ln := bytes.TrimSpace(lines[i])
+		if len(ln) >= 2 && ln[0] == '{' && ln[len(ln)-1] == '}' {
+			res = append(res, ln)
+		}
+	}
+	// reverse so the result reads in the original order
+	for i, j := 0, len(res)-1; i < j; i, j = i+1, j-1 {
+		res[i], res[j] = res[j], res[i]
+	}
+	return res
 }
 
 // tsmSignon builds the signon request line for a batch.
@@ -480,26 +539,95 @@ func (d *TsmHsmDriver) ArchiveWave(ctx context.Context, files []WaveFile) ([]str
 		lines = append(lines, string(req))
 		locs[i] = tsmLocator(d.opts.Filespace, hl, ll)
 	}
-	lines = append(lines, `{"op":"quit"}`)
-
-	// One helper batch signs on once and performs the per-file txn for
-	// every file of the wave. On any failure the helper has already
-	// aborted the individual txn (dsmEndTxn DSAPIS_VOTE_ABORT) and the
-	// daemon treats the whole wave as unarchived (matching the
-	// HsmDriver contract: "On any failure, all files in the wave are
-	// left unmodified on disk"). We cannot selectively undo the sends
-	// that succeeded before the failure; they remain as valid TSM
-	// versions (the DAPI model: object versions are additive and
-	// supersession is the caller's concern). This matches Bareos, which
-	// also leaves the already-run job cataloged.
-	resp, err := d.tsmBatch(ctx, lines)
-	if err != nil {
+	// Metadata companions ride in the SAME batch (see header doc): one
+	// extra `send` per file with a WaveFile.Meta snapshot.
+	if err := d.archiveMetaCompanions(files, &lines); err != nil {
+		d.removeMetaStaging()
 		return nil, err
 	}
-	if !resp.OK {
-		return nil, fmt.Errorf("tsm driver: helper batch failed: %s (rc=%d)", resp.Msg, resp.RC)
+	lines = append(lines, `{"op":"quit"}`)
+
+	resp, out, err := d.tsmBatch(ctx, lines)
+	if err != nil {
+		d.removeMetaStaging()
+		return nil, err
 	}
+	if !resp.OK || anyLineFailed(out) {
+		d.removeMetaStaging()
+		return nil, fmt.Errorf("tsm driver: helper batch failed: %s (output: %s)", firstFailedReason(out), truncated(out, 400))
+	}
+	d.removeMetaStaging()
 	return locs, nil
+}
+
+// archiveMetaCompanions appends a `send` request line for every file that
+// carries a WaveFile.Meta snapshot, staging the payload to a real file the
+// helper's `send` can read (the helper reads `path`, it cannot take an
+// inline byte string). The companion is a normal TSM object: it shares the
+// data object's high-level name (hl) and gets the deterministic low-level
+// name from MetaName(hl, ll), so archive / fetch / purge all derive it
+// from the same (hl, ll) without any persisted mapping.
+func (d *TsmHsmDriver) archiveMetaCompanions(files []WaveFile, lines *[]string) error {
+	for _, f := range files {
+		if len(f.Meta) == 0 {
+			continue
+		}
+		hl, ll, err := decomposePath(d.opts.Filespace, f.Path)
+		if err != nil {
+			return err
+		}
+		metaLL := MetaName(hl, ll)
+		staged, err := d.stageMetaPayload(metaLL, f.Meta)
+		if err != nil {
+			return err
+		}
+		d.metaStaging = append(d.metaStaging, staged)
+		req, _ := json.Marshal(map[string]string{
+			"op":   "send",
+			"fs":   d.opts.Filespace,
+			"hl":   hl,
+			"ll":   metaLL,
+			"path": staged,
+		})
+		*lines = append(*lines, string(req))
+	}
+	return nil
+}
+
+// stageMetaPayload writes the metadata bytes to a uniquely-named file in
+// the driver TmpDir and returns its path.
+func (d *TsmHsmDriver) stageMetaPayload(name string, payload []byte) (string, error) {
+	dir := d.opts.TmpDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("tsm driver: mkdir %q: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, "hsm-meta-*.json")
+	if err != nil {
+		return "", fmt.Errorf("tsm driver: create temp %q: %w", dir, err)
+	}
+	path := f.Name()
+	if _, err := f.Write(payload); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("tsm driver: write %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("tsm driver: close %q: %w", path, err)
+	}
+	return path, nil
+}
+
+// removeMetaStaging best-effort unlinks the companion staging files for a
+// wave (they are transient; on failure they are left for the OS).
+func (d *TsmHsmDriver) removeMetaStaging() {
+	for _, p := range d.metaStaging {
+		_ = os.Remove(p)
+	}
+	d.metaStaging = nil
 }
 
 func (d *TsmHsmDriver) Restore(ctx context.Context, locator string, wr io.Writer, size int64) error {
@@ -520,7 +648,7 @@ func (d *TsmHsmDriver) Restore(ctx context.Context, locator string, wr io.Writer
 		"path": livePath,
 	})
 	lines := []string{d.tsmSignon(), string(req), `{"op":"quit"}`}
-	resp, err := d.tsmBatch(ctx, lines)
+	resp, _, err := d.tsmBatch(ctx, lines)
 	if err != nil {
 		return err
 	}
@@ -558,21 +686,69 @@ func (d *TsmHsmDriver) Purge(ctx context.Context, locator string) error {
 	if fs != d.opts.Filespace {
 		return nil // Not this driver's store; idempotent no-op per contract.
 	}
-	req, _ := json.Marshal(map[string]string{
-		"op": "delete",
-		"fs": fs,
-		"hl": hl,
-		"ll": ll,
-	})
-	lines := []string{d.tsmSignon(), string(req), `{"op":"quit"}`}
-	resp, err := d.tsmBatch(ctx, lines)
+	// Remove the data object AND its metadata companion (deleting both
+	// in one sign-on/quit batch; the helper treats a missing companion
+	// as deleted:0, so this is idempotent even for objects archived
+	// before the companion feature existed).
+	reqData, _ := json.Marshal(map[string]string{"op": "delete", "fs": fs, "hl": hl, "ll": ll})
+	reqMeta, _ := json.Marshal(map[string]string{"op": "delete", "fs": fs, "hl": hl, "ll": MetaName(hl, ll)})
+	lines := []string{d.tsmSignon(), string(reqData), string(reqMeta), `{"op":"quit"}`}
+	resp, out, err := d.tsmBatch(ctx, lines)
 	if err != nil {
 		return err
 	}
-	if !resp.OK {
-		return fmt.Errorf("tsm driver: delete %s/%s: %s (rc=%d)", hl, ll, resp.Msg, resp.RC)
+	if !resp.OK || anyLineFailed(out) {
+		return fmt.Errorf("tsm driver: delete %s/%s: %s (rc=%d)", hl, ll, firstFailedReason(out), -1)
 	}
 	return nil
+}
+
+// FetchMeta retrieves the metadata companion of the object identified by
+// locator, returning its JSON payload. A locator whose object was archived
+// without a companion yields an empty payload (not an error): the daemon
+// then simply skips the replay. This implements the optional MetaPayload
+// interface so the daemon can drive it polymorphically.
+func (d *TsmHsmDriver) FetchMeta(ctx context.Context, locator string) ([]byte, error) {
+	fs, hl, ll, ok := parseTsmLocator(locator)
+	if !ok {
+		return nil, fmt.Errorf("tsm driver: malformed locator %q", locator)
+	}
+	if fs != d.opts.Filespace {
+		return nil, nil // not this driver's store
+	}
+	metaLL := MetaName(hl, ll)
+	dir := d.opts.TmpDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("tsm driver: mkdir %q: %w", dir, err)
+	}
+	staged, err := os.CreateTemp(dir, "hsm-meta-rx-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("tsm driver: create temp: %w", err)
+	}
+	target := staged.Name()
+	staged.Close()
+	defer os.Remove(target + ".tsmpartial")
+
+	req, _ := json.Marshal(map[string]string{"op": "get", "fs": fs, "hl": hl, "ll": metaLL, "path": target})
+	lines := []string{d.tsmSignon(), string(req), `{"op":"quit"}`}
+	resp, _, err := d.tsmBatch(ctx, lines)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Found != nil && !*resp.Found {
+		return nil, nil // no companion was archived
+	}
+	if resp.Found == nil && !resp.OK {
+		return nil, fmt.Errorf("tsm driver: get metadata companion: %s (rc=%d)", resp.Msg, resp.RC)
+	}
+	b, err := os.ReadFile(target + ".tsmpartial")
+	if err != nil {
+		return nil, fmt.Errorf("tsm driver: read restored metadata %q: %w", target, err)
+	}
+	return b, nil
 }
 
 func (d *TsmHsmDriver) Close() error { return nil }
