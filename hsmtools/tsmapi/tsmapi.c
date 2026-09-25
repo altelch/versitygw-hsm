@@ -1124,7 +1124,7 @@ static unsigned dateKey(const dsmDate *d)
          + (unsigned)d->hour * 100u + (unsigned)d->minute;
 }
 
-static int cliEnumAll(cliEnt **out, int *count)
+static int cliEnumAll(cliEnt **out, int *count, const char *filespace)
 {
     *out = NULL;
     *count = 0;
@@ -1132,7 +1132,10 @@ static int cliEnumAll(cliEnt **out, int *count)
 
     dsmObjName objName;
     memset(&objName, 0, sizeof(objName));
-    objName.fs[0] = 0;
+    /* Backup-data queries require a registered filespace (a bare "*"
+     * filespace matches nothing). Default "/" is the root filespace the
+     * daemon registers when its rootdir is "/". */
+    snprintf(objName.fs, sizeof(objName.fs), "%s", filespace && filespace[0] ? filespace : "/");
     objName.hl[0] = '*';
     snprintf(objName.ll, sizeof(objName.ll), "/*");
     objName.objType = DSM_OBJ_FILE;
@@ -1217,11 +1220,11 @@ static const char *unq(const char *s)
 
 /* --- ls ---------------------------------------------------------------------- */
 
-static int cmdCliLs(int showMeta)
+static int cmdCliLs(int showMeta, const char *filespace)
 {
     cliEnt *list = NULL;
     int count = 0;
-    if (cliEnumAll(&list, &count) != 0) {
+    if (cliEnumAll(&list, &count, filespace) != 0) {
         fprintf(stderr, "tsmapi: enumeration failed: %s\n", gRcMsg);
         return 1;
     }
@@ -1349,6 +1352,9 @@ static int cmdCliLs(int showMeta)
  *   tsmapi restore -n MYNODE -d /restore 'bin/.*' 'lib/.*'
  *
  * NOTES
+ *   - -F FILESPACE names the filespace objects are listed/restored under.
+ *     It must be the registered filespace — the daemon's --rootdir
+ *     (default: /). TSM backup-data queries reject a bare "*" filespace.
  *   - "hl/ll" here is the TSM name of the object, not necessarily a local
  *     filesystem path. To know what hl/ll your tiered objects have, use
  *   `tsmapi ls -n NODE` (or `tsmapi meta HL LL` for one name) so your
@@ -1531,8 +1537,8 @@ static int attrCbReplay(const char *name, const char *b64, void *arg)
 }
 
 static int cmdCliRestore(const char *node, const char *clientdir, const char *dsmopt,
-                         const char *options, const char *dest, const char *metaMode,
-                         const char *sidecarDir, int nRe, cliRe *res)
+                          const char *options, const char *dest, const char *metaMode,
+                          const char *sidecarDir, const char *filespace, int nRe, cliRe *res)
 {
     if (!dest || !*dest) { fprintf(stderr, "tsmapi: restore requires -d DEST\n"); return 2; }
     int mode = 0;          /* 0=xattr 1=sidecar 2=raw 3=none */
@@ -1558,7 +1564,7 @@ static int cmdCliRestore(const char *node, const char *clientdir, const char *ds
 
     cliEnt *list = NULL;
     int count = 0;
-    if (cliEnumAll(&list, &count) != 0) {
+    if (cliEnumAll(&list, &count, filespace) != 0) {
         fprintf(stderr, "tsmapi: enumeration failed: %s\n", gRcMsg);
         return 1;
     }
@@ -1726,12 +1732,14 @@ static void usage(int err)
 "NDJSON protocol (stdin/stdout, used by vgwtaped):\n"
 "  ping | version | signon | send | get | delete | query | quit\n\n"
 "Operator CLI modes (stdout = data, stderr = progress):\n"
-"  tsmapi ls      -n NODE [-c CLIENTDIR] [-o DSMOPT] [-M]\n"
-"  tsmapi restore -n NODE [-c CLIENTDIR] [-o DSMOPT] -d DEST\n"
+"  tsmapi ls      -n NODE [-F FILESPACE] [-c CLIENTDIR] [-o DSMOPT] [-M]\n"
+"  tsmapi restore -n NODE [-F FILESPACE] [-c CLIENTDIR] [-o DSMOPT] -d DEST\n"
 "                 [-m xattr|sidecar|raw|none] [--sidecar DIR] <ERE>...\n"
 "  tsmapi meta HL LL        (debug: print the companion object name)\n"
 "Common:\n"
 "  -n NODE        TSM client node (required)\n"
+"  -F FILESPACE   filespace to list/restore under (the daemon's --rootdir;\n"
+"                 must be the registered filespace, e.g. / or /data/pools)\n"
 "  -c CLIENTDIR   client config dir (default /opt/tivoli/tsm/client/ba/bin)\n"
 "  -o DSMOPT      extra dsm.opt path / inline options\n"
 "  -M             ls: include metadata companion objects\n"
@@ -1763,11 +1771,13 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[1], "ls")) {
         const char *node = NULL, *clientdir = "/opt/tivoli/tsm/client/ba/bin", *dsmopt = NULL;
+        const char *fs = NULL;      /* filespace (the daemon's --rootdir); default "/" */
         int showMeta = 0;
         for (int i = 2; i < argc; i++) {
             if (!strcmp(argv[i], "-n") && i + 1 < argc)              node = argv[++i];
             else if (!strcmp(argv[i], "-c") && i + 1 < argc)        clientdir = argv[++i];
             else if (!strcmp(argv[i], "-o") && i + 1 < argc)        dsmopt = argv[++i];
+            else if (!strcmp(argv[i], "-F") && i + 1 < argc)        fs = argv[++i];
             else if (!strcmp(argv[i], "-M"))                        showMeta = 1;
             else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(0); return 0; }
             else { usage(1); return 2; }
@@ -1778,20 +1788,21 @@ int main(int argc, char **argv)
             fprintf(stderr, "tsmapi: signon failed: %s\n", gRcMsg);
             return 1;
         }
-        int rc = cmdCliLs(showMeta);
+        int rc = cmdCliLs(showMeta, fs);
         if (gHandle) dsmTerminate(gHandle);
         if (gSetUpDone) dsmCleanUp(DSM_SINGLETHREAD);
         return rc;
     }
     if (!strcmp(argv[1], "restore")) {
         const char *node = NULL, *clientdir = "/opt/tivoli/tsm/client/ba/bin", *dsmopt = NULL;
-        const char *dest = NULL, *metaMode = "xattr", *sidecarDir = NULL;
+        const char *dest = NULL, *metaMode = "xattr", *sidecarDir = NULL, *fs = NULL;
         cliRe res[32];
         int nRe = 0, i = 2;
         for (; i < argc; i++) {
             if (!strcmp(argv[i], "-n") && i + 1 < argc)              node = argv[++i];
             else if (!strcmp(argv[i], "-c") && i + 1 < argc)        clientdir = argv[++i];
             else if (!strcmp(argv[i], "-o") && i + 1 < argc)        dsmopt = argv[++i];
+            else if (!strcmp(argv[i], "-F") && i + 1 < argc)        fs = argv[++i];
             else if (!strcmp(argv[i], "-d") && i + 1 < argc)        dest = argv[++i];
             else if (!strcmp(argv[i], "-m") && i + 1 < argc)        metaMode = argv[++i];
             else if (!strcmp(argv[i], "--sidecar") && i + 1 < argc) sidecarDir = argv[++i];
@@ -1806,7 +1817,7 @@ int main(int argc, char **argv)
         if (!node || !*node) { fprintf(stderr, "tsmapi: restore requires -n NODE\n"); return 2; }
         if (nRe == 0)        { fprintf(stderr, "tsmapi: restore requires at least one ERE pattern\n"); return 2; }
         gProtoFd = 2;
-        int rc = cmdCliRestore(node, clientdir, dsmopt, NULL, dest, metaMode, sidecarDir, nRe, res);
+        int rc = cmdCliRestore(node, clientdir, dsmopt, NULL, dest, metaMode, sidecarDir, fs, nRe, res);
         if (gHandle) dsmTerminate(gHandle);
         if (gSetUpDone) dsmCleanUp(DSM_SINGLETHREAD);
         return rc;

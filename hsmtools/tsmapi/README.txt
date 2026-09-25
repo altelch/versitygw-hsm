@@ -28,12 +28,15 @@ USAGE
   Without arguments          NDJSON protocol (daemon uses this)
   tsmapi -h | --help         print usage
 
-  tsmapi ls     -n NODE [-c CLIENTDIR] [-o DSMOPT] [-M]
-  tsmapi restore -n NODE [-c CLIENTDIR] [-o DSMOPT] -d DEST
+  tsmapi ls     -n NODE [-F FILESPACE] [-c CLIENTDIR] [-o DSMOPT] [-M]
+  tsmapi restore -n NODE [-F FILESPACE] [-c CLIENTDIR] [-o DSMOPT] -d DEST
                   [-m xattr|sidecar|raw|none] [--sidecar DIR] <ERE>...
   tsmapi meta HL LL
 
   -n NODE       TSM client node name (required for ls / restore)
+  -F FILESPACE  filespace to list/restore under (default: /). Must be the
+                registered filespace — i.e. the daemon's --rootdir.
+                TSM backup queries reject a bare "*" filespace.
   -c CLIENTDIR  client config dir holding dsm.sys/dsm.opt/NLS
                 (default: /opt/tivoli/tsm/client/ba/bin — must be
                 writable; tsmapi.log is written there)
