@@ -549,7 +549,16 @@ static int cmdSignon(const char *op)
         char *argvec[2] = { gArgv0, NULL };
         env.argv = argvec;
         int rc = dsmSetUp(DSM_SINGLETHREAD, &env);
-        if (rc != DSM_RC_OK) { dsmMsg(rc); snprintf(gRcMsg, sizeof(gRcMsg), "dsmSetUp failed"); return rsend(op, 0, rc, gRcMsg, NULL); }
+        if (rc == DSM_RC_NO_OPT_FILE) {
+            /* dsmSetUp does NOT auto-discover dsm.opt from dsmiDir: name
+             * the file explicitly (the Go driver derives and passes it;
+             * a raw ndjson signon may omit it). Mirror that default. */
+            char defOpt[sizeof(env.dsmiConfig)];
+            snprintf(defOpt, sizeof defOpt, "%s/dsm.opt", clientdir);
+            snprintf(env.dsmiConfig, sizeof(env.dsmiConfig), "%s", defOpt);
+            rc = dsmSetUp(DSM_SINGLETHREAD, &env);
+        }
+        if (rc != DSM_RC_OK) { dsmMsg(rc); snprintf(gRcMsg, sizeof(gRcMsg), "dsmSetUp %d", rc); return rsend(op, 0, rc, gRcMsg, NULL); }
         gSetUpDone = 1;
     }
 
@@ -1034,7 +1043,25 @@ static int cliDsmSignon(const char *node, const char *clientdir,
         char *argvec[2] = { gArgv0, NULL };
         env.argv = argvec;
         int rc = dsmSetUp(DSM_SINGLETHREAD, &env);
-        if (rc != DSM_RC_OK) { dsmMsg(rc); snprintf(gRcMsg, sizeof gRcMsg, "dsmSetUp failed"); return 1; }
+        if (rc == DSM_RC_NO_OPT_FILE) {
+            /* dsmSetUp does NOT auto-discover dsm.opt from dsmiDir:
+             * the documented workaround (see TsmOpts.DsmOpt in
+             * driver_tsm.go) is to name the file explicitly. Mirror the Go
+             * driver's default: <clientdir>/dsm.opt. One retry with that
+             * value is enough; any other failure keeps the original rc. */
+            char defOpt[sizeof(env.dsmiConfig)];
+            snprintf(defOpt, sizeof defOpt, "%s/dsm.opt", clientdir);
+            snprintf(env.dsmiConfig, sizeof(env.dsmiConfig), "%s", defOpt);
+            rc = dsmSetUp(DSM_SINGLETHREAD, &env);
+        }
+        if (rc != DSM_RC_OK) {
+            dsmMsg(rc);
+            snprintf(gRcMsg, sizeof(gRcMsg), "dsmSetUp rc=%d%s", rc,
+                     (rc == DSM_RC_NO_OPT_FILE)
+                         ? " (DSM_RC_NO_OPT_FILE: pass -o /path/to/dsm.opt)"
+                         : "");
+            return 1;
+        }
         gSetUpDone = 1;
     }
 
