@@ -56,6 +56,19 @@ func (c S3ApiController) DeleteObjects(ctx fiber.Ctx) (*Response, error) {
 		}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 
+	// S3 caps a single DeleteObjects request at 1000 keys. Reject an
+	// over-limit request before authorization and before anything reaches
+	// the backend, so a too-large batch can't be applied partially.
+	if len(dObj.Objects) > maxDeleteObjects {
+		debuglogger.Logf("delete objects: %d keys exceeds the limit of %d",
+			len(dObj.Objects), maxDeleteObjects)
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, s3err.GetAPIError(s3err.ErrMalformedXML)
+	}
+
 	// checkErrs holds one entry per requested object — nil where it may
 	// proceed to the backend, an AWS-shaped denial otherwise. DeleteObjects
 	// supports partial success, so a denial on one object (policy or object
@@ -131,28 +144,6 @@ func (c S3ApiController) POSTObject(ctx fiber.Ctx) (*Response, error) {
 
 	key := parsed.Fields["key"]
 
-	// A POST upload is an s3:PutObject on the object named by the form's
-	// key field, so it is authorized against that object's ARN — the same
-	// resource PutObject is — not the bucket's.
-	err := c.verifyAccess(ctx,
-		auth.AccessOptions{
-			Acl:             parsedAcl,
-			AclPermission:   auth.PermissionWrite,
-			IsRoot:          isRoot,
-			Acc:             acct,
-			Bucket:          bucket,
-			Object:          key,
-			Actions:         []auth.Action{auth.PutObjectAction},
-			IsPublicRequest: IsBucketPublic,
-		})
-	if err != nil {
-		return &Response{
-			MetaOpts: &MetaOptions{
-				BucketOwner: parsedAcl.Owner,
-			},
-		}, err
-	}
-
 	// parse POST policy — absent for anonymous uploads to public buckets
 	if !IsBucketPublic {
 		policyBase64 := parsed.Fields["policy"]
@@ -185,6 +176,7 @@ func (c S3ApiController) POSTObject(ctx fiber.Ctx) (*Response, error) {
 	// to pass PutObject, which expects the tagging to be a query string
 	var tagging string
 	if taggingXML, ok := parsed.Fields["tagging"]; ok {
+		var err error
 		tagging, err = utils.ConvertTaggingXMLToQueryString([]byte(taggingXML))
 		if err != nil {
 			return &Response{
@@ -216,6 +208,34 @@ func (c S3ApiController) POSTObject(ctx fiber.Ctx) (*Response, error) {
 	}
 
 	err = utils.ValidateWebsiteRedirectLocation(websiteRedirectLocation)
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
+	}
+
+	// A POST upload is an s3:PutObject on the object named by the form's
+	// key field, so it is authorized against that object's ARN — the same
+	// resource PutObject is — not the bucket's. Tagging the object also
+	// takes s3:PutObjectTagging, but only for a non-empty tag set
+	actions := []auth.Action{auth.PutObjectAction}
+	if tagging != "" {
+		actions = append(actions, auth.PutObjectTaggingAction)
+	}
+
+	err = c.verifyAccess(ctx,
+		auth.AccessOptions{
+			Acl:             parsedAcl,
+			AclPermission:   auth.PermissionWrite,
+			IsRoot:          isRoot,
+			Acc:             acct,
+			Bucket:          bucket,
+			Object:          key,
+			Actions:         actions,
+			IsPublicRequest: IsBucketPublic,
+		})
 	if err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
