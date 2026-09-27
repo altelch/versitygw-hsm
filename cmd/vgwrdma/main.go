@@ -115,6 +115,8 @@ var (
 	socketPerm                             string
 	rdmaIP                                 string
 	rcGidHint                              string
+	rcDevice                               string
+	rcGidIndex                             int
 	rdmaRCEnable                           bool
 	rdmaPort                               uint
 	poolBufSize                            int
@@ -906,10 +908,23 @@ func initFlags() []cli.Flag {
 			Destination: &rdmaIP,
 		},
 		&cli.StringFlag{
+			Name:        "rc-device",
+			Usage:       "verbs device name (e.g. mlx5_0) for the hipobj-rc-v2 RC data plane; takes precedence over --rc-gid-hint",
+			EnvVars:     []string{"VGW_RC_DEVICE"},
+			Destination: &rcDevice,
+		},
+		&cli.StringFlag{
 			Name:        "rc-gid-hint",
 			Usage:       "dotted GID prefix selecting the verbs device for the hipobj-rc-v2 RC data plane (default: first device)",
 			EnvVars:     []string{"VGW_RC_GID_HINT"},
 			Destination: &rcGidHint,
+		},
+		&cli.IntFlag{
+			Name:        "rc-gid-index",
+			Usage:       "GID index for the hipobj-rc-v2 RC data plane",
+			EnvVars:     []string{"VGW_RC_GID_INDEX"},
+			Value:       0,
+			Destination: &rcGidIndex,
 		},
 		&cli.BoolFlag{
 			Name:        "rdma-rc-enable",
@@ -1264,7 +1279,9 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 
 		rcSvc, err := rcserver.Init(rcserver.DeviceOpts{
 			GidHint:             rcGidHint,
+			DevName:             rcDevice,
 			Port:                1,
+			GidIdx:              rcGidIndex,
 			MaxSessions:         uint32(rcMaxSessions),
 			MaxUserSessions:     uint32(rcMaxUserSessions),
 			MaxStagingBytes:     rcMaxStagingBytes,

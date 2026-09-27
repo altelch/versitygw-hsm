@@ -300,6 +300,10 @@ std::string encodeReplyToken(hipObj::DeviceHandle *dh, uint32_t qpn) {
   std::memcpy(tok.gid, &dh->localGid, 16);
   tok.transport = hipObj::TRANSPORT_RC;
   tok.portNum = dh->portNum;
+  /* The client needs our LID to address us on InfiniBand; the
+   * token layout has always carried the field, it was just never
+   * filled in. */
+  tok.lid = dh->localLid;
   return hipObj::encodeRdmaToken(tok);
 }
 
@@ -346,14 +350,20 @@ int rc_server_init(const rc_device_opts *opts, rc_server **out) {
     return RC_E_INTERNAL;
   }
   struct ibv_device *chosen = devs[0];
-  /* GID hint: pick the first device/port whose GID starts with it.
-   * Query with srv->opts.port, which the normalization above has
-   * already made 1-based. */
+  /* Device name, when given, is the primary selector: on a host with
+   * several HCAs (an IB adapter next to a RoCE NIC, say) neither
+   * "first device" nor the 4-byte GID prefix can single out the
+   * one on the right fabric, since every link-local GID starts
+   * fe:80:0:0. Without a device name, use the GID hint to pick the
+   * first matching device/port. Query with srv->opts.port, which
+   * the normalization above has already made 1-based. */
+  const bool byName = opts->dev_name && *opts->dev_name;
   struct ibv_context *ctx = nullptr;
   for (int i = 0; i < n && !ctx; i++) {
+    if (byName && strcmp(devs[i]->name, opts->dev_name) != 0) continue;
     struct ibv_context *c = hipObj::ibv.open_device(devs[i]);
     if (!c) continue;
-    if (opts->gid_hint) {
+    if (!byName && opts->gid_hint) {
       union ibv_gid g;
       char dotted[64];
       for (int gi = 0; gi < 8; gi++) {
@@ -378,8 +388,20 @@ int rc_server_init(const rc_device_opts *opts, rc_server **out) {
   }
   if (!ctx) {
     hipObj::ibv.free_device_list(devs);
-    fprintf(stderr, "rc: no verbs device matches gid_hint %.32s\n",
-            opts->gid_hint ? opts->gid_hint : "");
+    if (byName) {
+      fprintf(stderr, "rc: no verbs device named %.64s\n", opts->dev_name);
+    } else {
+      fprintf(stderr, "rc: no verbs device matches gid_hint %.32s\n",
+              opts->gid_hint ? opts->gid_hint : "");
+    }
+    return RC_E_INTERNAL;
+  }
+  struct ibv_port_attr port_attr;
+  std::memset(&port_attr, 0, sizeof(port_attr));
+  if (hipObj::ibv.query_port(ctx, srv->opts.port, &port_attr) != 0) {
+    hipObj::ibv.free_device_list(devs);
+    hipObj::ibv.close_device(ctx);
+    fprintf(stderr, "rc: query_port failed for port %u\n", srv->opts.port);
     return RC_E_INTERNAL;
   }
   struct ibv_pd *pd = hipObj::ibv.alloc_pd(ctx);
@@ -396,6 +418,12 @@ int rc_server_init(const rc_device_opts *opts, rc_server **out) {
   srv->device->gidIndex = srv->opts.gid_index;
   hipObj::ibv.query_gid(ctx, srv->opts.port, srv->opts.gid_index,
                         &srv->device->localGid);
+  srv->device->localLid = port_attr.lid;
+  fprintf(stderr, "rc: device %s port %u gid_index %d lid %u link_layer %s\n",
+          ctx->device ? ctx->device->name : "?",
+          srv->opts.port, srv->opts.gid_index, srv->device->localLid,
+          port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND ? "InfiniBand"
+          : port_attr.link_layer == IBV_LINK_LAYER_ETHERNET ? "Ethernet" : "unknown");
   /* Expiry reaper: wakes periodically, marks sessions past
    * their prepare/execute deadlines, and runs the reap pass
    * itself so an abandoned session (one whose owner never sent
@@ -551,6 +579,7 @@ int rc_prepare(rc_server *srv, const rc_prepare_req *req,
         return RC_E_ARG;
       }
       std::memcpy(&rs.core.peerGid, tok.gid, 16);
+      rs.core.peerLid = tok.lid;
       rs.has_peer_gid = true;
       /* Stash the client MR endpoint when the token carries one
        * (PUT destination advertised at PREPARE time). */
@@ -864,10 +893,13 @@ int rc_ready_transfer(rc_server *srv, const rc_ready_req *req,
    * peer GID comes from the PREPARE token when the client sent
    * one, otherwise our own GID (same-HCA loopback). */
   union ibv_gid destGid = {};
+  uint16_t destLid = 0;
   if (s->has_peer_gid) {
     destGid = s->core.peerGid;
+    destLid = s->core.peerLid;
   } else {
     destGid = srv->device->localGid;
+    destLid = srv->device->localLid;
   }
   hipObj::RcConnV2 conn;
   conn.qp = s->core.qp;
@@ -876,7 +908,7 @@ int rc_ready_transfer(rc_server *srv, const rc_ready_req *req,
   g.unlock();
   if (hipObj::v2::transitionQpToRtrV2(srv->device, conn,
                                       req->client_qpn,
-                                      /*destLid*/ 0, destGid,
+                                      destLid, destGid,
                                       s->core.clientPsn) != 0) {
     g.lock();
     s->last_outcome = RC_READY_WIRE_FAIL;

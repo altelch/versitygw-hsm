@@ -1759,6 +1759,11 @@ func TestS3IAMAccessControl(ts *TestState) {
 	ts.Run(S3IAMAccessControl_bucket_policy_explicit_deny)
 	ts.Run(S3IAMAccessControl_policy_combinations)
 	ts.Run(S3IAMAccessControl_copy_object_requires_both_sides)
+	ts.Run(S3IAMAccessControl_put_object_tagging_split_sources)
+	ts.Run(S3IAMAccessControl_copy_object_tagging_split_sources)
+	ts.Run(S3IAMAccessControl_create_multipart_upload_tagging_split_sources)
+	ts.Run(S3IAMAccessControl_post_object_tagging_split_sources)
+	ts.Run(S3IAMAccessControl_put_object_lock_split_sources)
 	ts.Run(S3IAMAccessControl_create_bucket)
 	ts.Run(S3IAMAccessControl_list_buckets)
 	ts.Run(S3IAMAccessControl_governance_bypass_sources)
@@ -2051,6 +2056,8 @@ func TestVersioning(ts *TestState) {
 	// Multipart upload
 	ts.Run(Versioning_Multipart_Upload_success)
 	ts.Run(Versioning_Multipart_Upload_overwrite_an_object)
+	ts.Run(Versioning_Multipart_Upload_suspended_overwrite_versioned_object)
+	ts.Run(Versioning_Multipart_Upload_overwrite_keeps_previous_version_metadata)
 	ts.Run(Versioning_UploadPartCopy_invalid_versionId)
 	ts.Run(Versioning_UploadPartCopy_encoded_versionid_separator_invalid_versionId)
 	ts.Run(Versioning_UploadPartCopy_non_existing_versionId)
@@ -2274,6 +2281,11 @@ func GetIntTests() IntTests {
 		"S3IAMAccessControl_bucket_policy_explicit_deny":                                   S3IAMAccessControl_bucket_policy_explicit_deny,
 		"S3IAMAccessControl_policy_combinations":                                           S3IAMAccessControl_policy_combinations,
 		"S3IAMAccessControl_copy_object_requires_both_sides":                               S3IAMAccessControl_copy_object_requires_both_sides,
+		"S3IAMAccessControl_put_object_tagging_split_sources":                              S3IAMAccessControl_put_object_tagging_split_sources,
+		"S3IAMAccessControl_copy_object_tagging_split_sources":                             S3IAMAccessControl_copy_object_tagging_split_sources,
+		"S3IAMAccessControl_create_multipart_upload_tagging_split_sources":                 S3IAMAccessControl_create_multipart_upload_tagging_split_sources,
+		"S3IAMAccessControl_post_object_tagging_split_sources":                             S3IAMAccessControl_post_object_tagging_split_sources,
+		"S3IAMAccessControl_put_object_lock_split_sources":                                 S3IAMAccessControl_put_object_lock_split_sources,
 		"S3IAMAccessControl_create_bucket":                                                 S3IAMAccessControl_create_bucket,
 		"S3IAMAccessControl_list_buckets":                                                  S3IAMAccessControl_list_buckets,
 		"S3IAMAccessControl_governance_bypass_sources":                                     S3IAMAccessControl_governance_bypass_sources,
@@ -3613,6 +3625,8 @@ func GetIntTests() IntTests {
 		"ListObjectVersions_checksum":                                                      ListObjectVersions_checksum,
 		"Versioning_Multipart_Upload_success":                                              Versioning_Multipart_Upload_success,
 		"Versioning_Multipart_Upload_overwrite_an_object":                                  Versioning_Multipart_Upload_overwrite_an_object,
+		"Versioning_Multipart_Upload_suspended_overwrite_versioned_object":                 Versioning_Multipart_Upload_suspended_overwrite_versioned_object,
+		"Versioning_Multipart_Upload_overwrite_keeps_previous_version_metadata":            Versioning_Multipart_Upload_overwrite_keeps_previous_version_metadata,
 		"Versioning_UploadPartCopy_invalid_versionId":                                      Versioning_UploadPartCopy_invalid_versionId,
 		"Versioning_UploadPartCopy_encoded_versionid_separator_invalid_versionId":          Versioning_UploadPartCopy_encoded_versionid_separator_invalid_versionId,
 		"Versioning_UploadPartCopy_non_existing_versionId":                                 Versioning_UploadPartCopy_non_existing_versionId,
