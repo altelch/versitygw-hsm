@@ -5,7 +5,8 @@ before:
     - go mod tidy
 
 builds:
-  - goos:
+  - id: versitygw
+    goos:
       - linux
       - darwin
       - freebsd
@@ -22,7 +23,8 @@ builds:
       - arm64
     ldflags:
       - -X=main.Build={{.Commit}} -X=main.BuildTime={{.Date}} -X=main.Version={{.Version}}
-  - goos:
+  - id: vgwtaped
+    goos:
       - linux
       - darwin
       - freebsd
@@ -134,7 +136,7 @@ nfpms:
       - src: extra/example-iam.conf
         dst: /etc/versitygw.d/example-iam.conf
         type: config
-  
+
       - dst: /etc/versitygw.d
         type: dir
         file_info:
@@ -158,6 +160,54 @@ nfpms:
 
       - src: extra/versitygw.fish
         dst: /usr/share/fish/vendor_completions.d/versitygw.fish
+
+  - id: hsm
+    package_name: versitygw-hsm
+    vendor: Versity Software
+    homepage: https://github.com/altelch/versitygw-hsm
+    maintainer: Ben McClelland <ben.mcclelland@versity.com>
+
+    description: |-
+      The Versity HSM tiering daemon (vgwtaped).
+      Moves cold objects out of the gateway root to a target-tier
+      driver (IBM Storage Protect / TSM or Bareos) and restores them
+      on demand. Pairs with the versitygw gateway package; the TSM
+      driver additionally needs the tsmapi helper built from
+      hsmtools/tsmapi against the machine's own TSM client.
+
+    license: Apache 2.0
+
+    recommends:
+      - versitygw
+
+    ids:
+      - vgwtaped
+
+    formats:
+      - deb
+      - rpm
+
+    umask: 0o002
+    bindir: /usr/bin
+    epoch: "1"
+    release: "1"
+    section: "net"
+
+    contents:
+      - src: extra/vgwtaped@.service
+        dst: /lib/systemd/system/vgwtaped@.service
+
+      - src: extra/vgwtaped.conf.example
+        dst: /etc/vgwtaped.d/example.conf
+        type: config
+
+      - src: hsmtools/tsmapi/README.txt
+        dst: /usr/share/doc/versitygw-hsm/README.hsm
+
+      - dst: /etc/vgwtaped.d
+        type: dir
+        file_info:
+          mode: 0755
 
 
 

@@ -1,0 +1,32 @@
+[Unit]
+Description=VersityGW HSM tiering daemon
+Documentation=https://github.com/altelch/versitygw-hsm
+Wants=network-online.target
+After=network-online.target remote-fs.target
+AssertFileIsExecutable=/usr/bin/vgwtaped
+AssertPathExists=/etc/vgwtaped.d/%i.conf
+
+[Service]
+WorkingDirectory=/root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vgwtaped-%i
+
+User=root
+Group=root
+
+EnvironmentFile=/etc/vgwtaped.d/%i.conf
+
+ExecStart=/bin/bash -c 'if [[ ! ("${VGWTAPED_DRIVER}" == "mock" || "${VGWTAPED_DRIVER}" == "bareos" || "${VGWTAPED_DRIVER}" == "tsm" || -z "${VGWTAPED_DRIVER}") ]]; then echo "VGWTAPED_DRIVER environment variable ${VGWTAPED_DRIVER} is not a valid driver type (mock|bareos|tsm)"; exit 1; fi && exec /usr/bin/vgwtaped'
+
+# Let systemd restart this service always
+Restart=always
+
+# Specifies the maximum file descriptor number that can be opened by this process
+LimitNOFILE=65536
+
+# Specifies the maximum number of threads this process can create
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+# vgwtaped environment file — /etc/vgwtaped.d/%i.conf
+# (loaded by the vgwtaped@.service systemd template; one service instance
+# per instance name, e.g. `systemctl start vgwtaped@hsm1.service`)
+#
+# Keys map 1:1 to vgwtaped flags (see `vgwtaped --help`), one per line,
+# `KEY=value`. Commented-out lines are defaults.
+
+# --- object root / state (required) ----------------------------------------
+#VGWTAPED_ROOTDIR=/data/pools
+#VGWTAPED_STATE_DIR=/var/lib/vgwtaped/state
+#VGWTAPED_SIDECAR=            # sidecar metadata dir, must equal the gateway's --sidecar
+#VGWTAPED_POLICY=             # tiering policy YAML
+
+# --- driver ----------------------------------------------------------------
+# driver: mock (default) | bareos | tsm
+#VGWTAPED_DRIVER=tsm
+
+# --- Bareos ----------------------------------------------------------------
+#VGWTAPED_BAREOS_CLIENT=CLIENT.versity-build.rhrk.uni-kl.de
+#VGWTAPED_BAREOS_BACKUP=Backup-vgwtaped
+#VGWTAPED_BAREOS_RESTORE=Restore-vgwtaped
+#VGWTAPED_BAREOS_CONF=/var/lib/bareos/bconsole.conf
+#VGWTAPED_BAREOS_DIRECTOR=
+#VGWTAPED_BAREOS_FILELIST=    # default <state-dir>/hsm-bareos-filelist.txt
+#VGWTAPED_BAREOS_METADIR=     # sidecar-companion scratch, default <state-dir>
+
+# --- TSM (IBM Storage Protect) ---------------------------------------------
+#VGWTAPED_TSM_NODE=VERSITY-BUILD
+#VGWTAPED_TSM_OWNER=
+#VGWTAPED_TSM_FILESPACE=      # default --rootdir
+#VGWTAPED_TSM_HELPER=/usr/local/bin/tsmapi
+#VGWTAPED_TSM_CLIENTDIR=/opt/tivoli/tsm/client/ba/bin
+#VGWTAPED_TSM_OPTIONS=
+#VGWTAPED_TSM_TMPDIR=         # default <state-dir>
+
+# --- ZFS (incremental scan) -------------------------------------------------
+#VGWTAPED_ZFS_DATASET=
+
+# --- daemon tuning ----------------------------------------------------------
+#VGWTAPED_WORKERS=4
+#VGWTAPED_SCAN_INTERVAL=5m
+#VGWTAPED_GC=true
+#VGWTAPED_DEBUG=false

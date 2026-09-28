@@ -6,6 +6,12 @@ on:
     # run only against tags
     tags:
       - '*'
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: "Snapshot build (no tag, nothing published)"
+        type: boolean
+        default: true
 
 jobs:
   goreleaser:
@@ -29,6 +35,6 @@ jobs:
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: release --clean
+          args: ${{ inputs.snapshot == 'true' && 'release --snapshot --clean --skip=publish' || 'release --clean' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

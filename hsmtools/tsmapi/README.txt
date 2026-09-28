@@ -24,6 +24,14 @@ BUILD
 
   The versitygw Go build stays pure-Go; only this helper needs the SDK.
 
+  PACKAGING: the released debs (versitygw, versitygw-hsm) do NOT
+  bundle tsmapi — linking it requires IBM's proprietary SDK/GSK8
+  libraries. Build and install it on each TSM host that runs the
+  daemon with `--driver tsm` (see BUILD above), i.e.
+    git clone https://github.com/altelch/versitygw-hsm
+    ( cd versitygw-hsm/hsmtools/tsmapi && make && sudo make install )
+  and point the daemon at it: VGWTAPED_TSM_HELPER=/usr/local/bin/tsmapi
+
 USAGE
   Without arguments          NDJSON protocol (daemon uses this)
   tsmapi -h | --help         print usage
