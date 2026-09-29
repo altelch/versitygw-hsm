@@ -35,7 +35,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
@@ -255,6 +257,36 @@ func ParseCopySource(copySourceHeader string) (string, string, string, error) {
 	}
 
 	return srcBucket, srcObject, versionId, nil
+}
+
+// UploadPartHasIntegrityCheck reports whether a part upload carries an
+// integrity check of its body: Content-MD5, an x-amz-checksum-* header, or
+// an x-amz-checksum-* trailer, which the body reader then carries. A part of
+// a multipart upload with Object Lock parameters must carry one.
+func UploadPartHasIntegrityCheck(input *s3.UploadPartInput) bool {
+	if input.ContentMD5 != nil && *input.ContentMD5 != "" {
+		return true
+	}
+	if tr, ok := input.Body.(interface{ Algorithm() string }); ok && tr.Algorithm() != "" {
+		return true
+	}
+	for _, sum := range []*string{
+		input.ChecksumCRC32,
+		input.ChecksumCRC32C,
+		input.ChecksumCRC64NVME,
+		input.ChecksumSHA1,
+		input.ChecksumSHA256,
+		input.ChecksumSHA512,
+		input.ChecksumMD5,
+		input.ChecksumXXHASH64,
+		input.ChecksumXXHASH3,
+		input.ChecksumXXHASH128,
+	} {
+		if sum != nil && *sum != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseObjectTags parses the url encoded input string into
@@ -606,6 +638,28 @@ func MoveFile(source, destination string, perm os.FileMode) error {
 	}
 
 	return nil
+}
+
+// IsPermissionErr reports whether err is a filesystem permission failure,
+// EACCES or EPERM. Windows ERROR_ACCESS_DENIED is left out: Windows also
+// returns it for transient states, such as a name whose delete is still
+// pending.
+func IsPermissionErr(err error) bool {
+	return errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
+}
+
+// MapPermissionErr replaces a filesystem permission failure in *err with
+// AccessDenied; filesystem backend methods that write defer it. The gateway
+// process lacking a permission is not transient: a retry fails the same way,
+// while the InternalError it would otherwise become has S3 clients retry it
+// several times before giving up. The cause is logged at debug level, since
+// the gateway's filesystem permissions denied the request, not its
+// authorization.
+func MapPermissionErr(err *error) {
+	if err != nil && IsPermissionErr(*err) {
+		debuglogger.Logf("filesystem permission denied, reporting AccessDenied: %v", *err)
+		*err = s3err.GetAPIError(s3err.ErrAccessDenied)
+	}
 }
 
 // GenerateEtag generates a new quoted etag from the provided hash.Hash
