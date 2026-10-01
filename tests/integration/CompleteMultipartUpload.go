@@ -54,6 +54,54 @@ func CompletedMultipartUpload_non_existing_bucket(s *S3Conf) error {
 	})
 }
 
+func CompleteMultipartUpload_upload_id_path_traversal(s *S3Conf) error {
+	testName := "CompleteMultipartUpload_upload_id_path_traversal"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		objs, err := putObjects(s3client, []string{"victim-dir/1"}, bucket)
+		if err != nil {
+			return err
+		}
+
+		// A posix upload directory is three levels below its bucket, so
+		// the upload ID names the directory holding "victim-dir/1", which
+		// would be taken as part 1 and removed with the upload.
+		obj := "my-obj"
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: getPtr("../../../victim-dir"),
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: []types.CompletedPart{
+					{ETag: objs[0].ETag, PartNumber: getPtr(int32(1))},
+				},
+			},
+		})
+		cancel()
+		if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrNoSuchUpload)); err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    objs[0].Key,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		return checkSdkApiErr(err, "NotFound")
+	})
+}
+
 func CompleteMultipartUpload_incorrect_part_number(s *S3Conf) error {
 	testName := "CompleteMultipartUpload_incorrect_part_number"
 	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
@@ -1739,6 +1787,113 @@ func CompleteMultipartUpload_default_content_type(s *S3Conf) error {
 
 		if getString(res.ContentType) != defaultContentType {
 			return fmt.Errorf("expected default %s Content-Type, instead got %s", defaultContentType, getString(res.ContentType))
+		}
+
+		return nil
+	})
+}
+
+func CompleteMultipartUpload_overwrite_resets_attributes(s *S3Conf) error {
+	testName := "CompleteMultipartUpload_overwrite_resets_attributes"
+	return actionHandler(s, testName, func(s3client *s3.Client, bucket string) error {
+		obj := "my-obj"
+		expires := time.Now().Add(time.Hour)
+
+		_, err := putObjectWithData(10, &s3.PutObjectInput{
+			Bucket:                  &bucket,
+			Key:                     &obj,
+			ContentType:             getPtr("text/plain"),
+			ContentEncoding:         getPtr("gzip"),
+			ContentDisposition:      getPtr("inline"),
+			ContentLanguage:         getPtr("en"),
+			CacheControl:            getPtr("no-cache"),
+			Expires:                 &expires,
+			WebsiteRedirectLocation: getPtr("/redirect"),
+			Metadata:                map[string]string{"foo": "bar"},
+			Tagging:                 getPtr("key=val"),
+		}, s3client)
+		if err != nil {
+			return err
+		}
+
+		mp, err := createMp(s3client, bucket, obj)
+		if err != nil {
+			return err
+		}
+
+		parts, _, err := uploadParts(s3client, 20, 1, bucket, obj, *mp.UploadId)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+		_, err = s3client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &bucket,
+			Key:      &obj,
+			UploadId: mp.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: []types.CompletedPart{
+					{
+						ETag:       parts[0].ETag,
+						PartNumber: parts[0].PartNumber,
+					},
+				},
+			},
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		// the object holds none of the replaced object's attributes
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		out, err := s3client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if getString(out.ContentType) != defaultContentType {
+			return fmt.Errorf("expected default %s Content-Type, instead got %s",
+				defaultContentType, getString(out.ContentType))
+		}
+		for _, hdr := range []struct {
+			name  string
+			value *string
+		}{
+			{"Content-Encoding", out.ContentEncoding},
+			{"Content-Disposition", out.ContentDisposition},
+			{"Content-Language", out.ContentLanguage},
+			{"Cache-Control", out.CacheControl},
+			{"Expires", out.ExpiresString},
+			{"x-amz-website-redirect-location", out.WebsiteRedirectLocation},
+		} {
+			if hdr.value != nil {
+				return fmt.Errorf("expected nil %s, instead got %s", hdr.name, *hdr.value)
+			}
+		}
+		if len(out.Metadata) != 0 {
+			return fmt.Errorf("expected empty metadata, instead got %v", out.Metadata)
+		}
+		if out.TagCount != nil {
+			return fmt.Errorf("expected nil tag count, instead got %v", *out.TagCount)
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
+		tagging, err := s3client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+			Bucket: &bucket,
+			Key:    &obj,
+		})
+		cancel()
+		if err != nil {
+			return err
+		}
+
+		if len(tagging.TagSet) != 0 {
+			return fmt.Errorf("expected empty tag set, instead got %v", tagging.TagSet)
 		}
 
 		return nil
